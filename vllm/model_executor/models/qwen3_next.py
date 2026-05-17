@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -236,6 +237,11 @@ class Qwen3NextAttention(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        import logging as _lg
+        _lg.getLogger(__name__).warning(
+            "[ATTN_HD] hidden=%d num_heads=%d num_kv=%d head_dim=%d q_size=%d kv_size=%d attn_gate=%s",
+            self.hidden_size, self.total_num_heads, self.total_num_kv_heads,
+            self.head_dim, self.q_size, self.kv_size, self.attn_output_gate)
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -519,6 +525,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        _layer_dbg = int(os.environ.get("VLLM_LAYER_DBG", "0"))
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -528,6 +535,11 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            if _layer_dbg:
+                r = residual if residual is not None else hidden_states
+                logger.warning("[LAYER_DBG] layer=%d resid_norm=%.4f hs_norm=%.4f",
+                               layer_idx, r.float().norm(dim=-1).mean().item(),
+                               hidden_states.float().norm(dim=-1).mean().item())
             self._maybe_add_hidden_state(
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )

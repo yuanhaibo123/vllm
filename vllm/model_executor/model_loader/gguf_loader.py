@@ -119,6 +119,13 @@ class GGUFModelLoader(BaseModelLoader):
         is_multimodal = (
             hasattr(config, "vision_config") and config.vision_config is not None
         )
+        # For multimodal parent configs that wrap a text sub-config
+        # (e.g. Qwen3_5Config with model_type "qwen3_5"), use the text
+        # config's model_type for GGUF arch lookup when loading text-only
+        # GGUF files.
+        if text_config is not config and hasattr(text_config, "model_type"):
+            model_type = text_config.model_type
+            is_multimodal = False
         gguf_to_hf_name_map = {}
         sideload_params: list[re.Pattern] = []
         # hack: ggufs have a different name than transformers
@@ -195,6 +202,71 @@ class GGUFModelLoader(BaseModelLoader):
                     )
                 )
 
+        # Map HF model_type aliases that don't appear verbatim in MODEL_ARCH_NAMES
+        _HF_TO_GGUF_MODEL_TYPE: dict[str, str] = {
+            "qwen3_5_text": "qwen35",
+            "qwen3_5_moe_text": "qwen35moe",
+        }
+        # Qwen3.5 hybrid SSM/attention: fix tensor name mappings and
+        # set all SSM config fields directly from GGUF metadata (the
+        # single source of truth), mirroring how llama.cpp derives
+        # dimensions in qwen35.cpp::load_arch_hparams/load_arch_tensors.
+        if model_type in ("qwen3_5_text", "qwen3_5"):
+            # 1. Tensor name fixes: auto-map fails for dt_bias and A_log
+            for idx in range(text_config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
+                    f"model.layers.{idx}.linear_attn.dt_bias"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_a"] = (
+                    f"model.layers.{idx}.linear_attn.A_log"
+                )
+            # 2. Read all SSM dimensions from GGUF metadata and set them
+            #    on the config, exactly like llama.cpp does:
+            #      ssm.group_count    → n_k_heads  (linear_num_key_heads)
+            #      ssm.time_step_rank → n_v_heads  (linear_num_value_heads)
+            #      ssm.state_size     → head_k_dim (linear_key_head_dim)
+            #      ssm.inner_size     → value_dim  (ssm_inner_size)
+            #      ssm.conv_kernel    → conv_dim   (linear_conv_kernel_dim)
+            #      linear_value_head_dim = ssm_inner_size / n_v_heads
+            _reader = gguf.GGUFReader(model_config.model)
+            _arch = "qwen35"
+
+            def _gguf_int(field_name: str) -> int | None:
+                k = f"{_arch}.{field_name}"
+                if k in _reader.fields:
+                    return int(_reader.fields[k].parts[-1][0])
+                return None
+
+            _field_map: list[tuple[str, str]] = [
+                ("ssm.group_count",    "linear_num_key_heads"),
+                ("ssm.time_step_rank", "linear_num_value_heads"),
+                ("ssm.state_size",     "linear_key_head_dim"),
+                ("ssm.inner_size",     "ssm_inner_size"),
+                ("ssm.conv_kernel",    "linear_conv_kernel_dim"),
+                ("attention.key_length", "head_dim"),
+            ]
+            for gguf_field, hf_attr in _field_map:
+                val = _gguf_int(gguf_field)
+                if val is not None:
+                    old = getattr(text_config, hf_attr, None)
+                    if old != val:
+                        logger.info("GGUF → %s = %d (was %s)",
+                                    hf_attr, val, old)
+                    setattr(text_config, hf_attr, val)
+
+            # Derived: linear_value_head_dim = ssm_inner_size / n_v_heads
+            _inner = getattr(text_config, "ssm_inner_size", None)
+            _nvh = getattr(text_config, "linear_num_value_heads", None)
+            if _inner and _nvh:
+                vhd = _inner // _nvh
+                old = getattr(text_config, "linear_value_head_dim", None)
+                if old != vhd:
+                    logger.info("GGUF → linear_value_head_dim = %d (was %s)",
+                                vhd, old)
+                text_config.linear_value_head_dim = vhd
+
+        model_type = _HF_TO_GGUF_MODEL_TYPE.get(model_type, model_type)
+
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:
@@ -219,9 +291,12 @@ class GGUFModelLoader(BaseModelLoader):
         auto_cls = (
             AutoModelForImageTextToText if is_multimodal else AutoModelForCausalLM
         )
+        # When the top-level config is a multimodal wrapper but we're
+        # loading a text-only GGUF, use the text sub-config directly.
+        dummy_config = text_config if text_config is not config and not is_multimodal else config
         with torch.device("meta"):
             dummy_model = auto_cls.from_config(
-                config, trust_remote_code=model_config.trust_remote_code
+                dummy_config, trust_remote_code=model_config.trust_remote_code
             )
 
         state_dict = dummy_model.state_dict()
@@ -350,6 +425,12 @@ class GGUFModelLoader(BaseModelLoader):
         for f in gguf_files:
             weight_type_map.update(get_gguf_weight_type_map(f, gguf_to_hf_name_map))
         is_multimodal = hasattr(model_config.hf_config, "vision_config")
+        # Skip multimodal handling when the top-level config wraps a text
+        # sub-config (text-only GGUF from a multimodal model family).
+        if is_multimodal:
+            text_cfg = model_config.hf_config.get_text_config()
+            if text_cfg is not model_config.hf_config:
+                is_multimodal = False
         if is_multimodal:
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
@@ -381,6 +462,10 @@ class GGUFModelLoader(BaseModelLoader):
         """
         hf_config = model_config.hf_config
         is_multimodal = hasattr(hf_config, "vision_config")
+        if is_multimodal:
+            text_cfg = hf_config.get_text_config()
+            if text_cfg is not hf_config:
+                is_multimodal = False
 
         if is_multimodal:
             # Load mm_proj (mm_encoder + projector) for multimodal weights

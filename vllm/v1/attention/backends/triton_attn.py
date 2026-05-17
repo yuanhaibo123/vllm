@@ -46,6 +46,57 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+def _pytorch_paged_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    output: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    scale: float,
+    num_queries_per_kv: int,
+) -> None:
+    """Paged attention via PyTorch SDPA — fallback for sm70 where the
+    Triton unified_attention kernel silently produces zeros.
+
+    key_cache / value_cache: [num_blocks, block_size, nKV, dH]
+    query:                   [num_actual_tokens, nH, dH]
+    output:                  [num_actual_tokens, nH*dH]  (written in-place)
+    cu_seqlens_q:            [num_seqs+1]  cumulative query-token offsets
+    seqused_k:               [num_seqs]    actual KV lengths per sequence
+    block_table:             [num_seqs, max_blocks_per_seq]
+    """
+    import torch.nn.functional as F
+    block_size = key_cache.shape[1]
+    for i in range(int(seqused_k.shape[0])):
+        q_start = int(cu_seqlens_q[i])
+        q_end   = int(cu_seqlens_q[i + 1])
+        if q_start == q_end:
+            continue
+        k_len = int(seqused_k[i])
+        num_blocks_needed = (k_len + block_size - 1) // block_size
+        blocks  = block_table[i, :num_blocks_needed]        # [nblk]
+        k_paged = key_cache[blocks]                         # [nblk, bs, nKV, dH]
+        v_paged = value_cache[blocks]
+        nKV, dH = int(k_paged.shape[2]), int(k_paged.shape[3])
+        k_flat  = k_paged.reshape(-1, nKV, dH)[:k_len]     # [k_len, nKV, dH]
+        v_flat  = v_paged.reshape(-1, nKV, dH)[:k_len]
+        q_i   = query[q_start:q_end]                        # [q_len, nH, dH]
+        q_len = q_end - q_start
+        if num_queries_per_kv > 1:
+            k_flat = k_flat.repeat_interleave(num_queries_per_kv, dim=1)
+            v_flat = v_flat.repeat_interleave(num_queries_per_kv, dim=1)
+        # [1, nH, seq, dH] for SDPA
+        q_s = q_i.permute(1, 0, 2).unsqueeze(0)
+        k_s = k_flat.permute(1, 0, 2).unsqueeze(0)
+        v_s = v_flat.permute(1, 0, 2).unsqueeze(0)
+        out_i = F.scaled_dot_product_attention(
+            q_s, k_s, v_s, scale=scale, is_causal=True
+        )  # [1, nH, q_len, dH]
+        output[q_start:q_end] = out_i.squeeze(0).permute(1, 0, 2)  # [q_len, nH, dH]
+
+
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
@@ -503,6 +554,10 @@ class TritonAttentionImpl(AttentionImpl):
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
 
+        # The sm70 all-zeros bug in unified_attention was fixed in Triton 3.x.
+        # Verified correct on SM70 with Triton 3.6.0 (error < 1e-4 vs PyTorch).
+        self._use_pytorch_attn_fallback = False
+
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel Xe2/Xe3).  The dead branch
         # is eliminated at Triton compile time, so other platforms see
@@ -621,6 +676,20 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+
+        if self._use_pytorch_attn_fallback:
+            _pytorch_paged_attention(
+                query=query[:num_actual_tokens],
+                key_cache=key_cache,
+                value_cache=value_cache,
+                output=output[:num_actual_tokens],
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_k=seqused_k,
+                block_table=block_table,
+                scale=self.scale,
+                num_queries_per_kv=self.num_queries_per_kv,
+            )
+            return output
 
         unified_attention(
             q=query[:num_actual_tokens],

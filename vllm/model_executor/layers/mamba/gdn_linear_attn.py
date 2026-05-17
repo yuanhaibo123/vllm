@@ -7,6 +7,9 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
+# Debug flag: set to True from outside to print GDN forward diagnostics once
+_GDN_DBG_ENABLED: bool = True
+
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import (
@@ -44,6 +47,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
+import torch.nn.functional as F
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -81,6 +85,55 @@ if GDN_AITER_TRITON_AVAILABLE:
     )
 
 logger = init_logger(__name__)
+
+
+_POST_CONV_PREP_DBG_FIRED = False
+
+def _pytorch_post_conv_prep(
+    conv_output: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    num_k_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    apply_l2norm: bool = True,
+    output_g_exp: bool = False,
+) -> tuple:
+    """Pure-PyTorch fallback for fused_post_conv_prep (sm70 / Triton fails)."""
+    global _POST_CONV_PREP_DBG_FIRED
+    L = conv_output.shape[0]
+    H, K, V = num_k_heads, head_k_dim, head_v_dim
+    HV = A_log.shape[0]
+    dtype = conv_output.dtype
+
+    if not _POST_CONV_PREP_DBG_FIRED:
+        _POST_CONV_PREP_DBG_FIRED = True
+        logger.warning("[PCP_DBG] H=%d K=%d V=%d HV=%d L=%d a.shape=%s b.shape=%s a_mean=%.4f a_std=%.4f b_mean=%.4f b_std=%.4f A_log=%s dt_bias=%s",
+                       H, K, V, HV, L, list(a.shape), list(b.shape),
+                       a.float().mean().item(), a.float().std().item(),
+                       b.float().mean().item(), b.float().std().item(),
+                       A_log.float().tolist()[:4], dt_bias.float().tolist()[:4])
+
+    q = conv_output[:, :H * K].reshape(L, H, K).float()
+    k = conv_output[:, H * K:2 * H * K].reshape(L, H, K).float()
+    v = conv_output[:, 2 * H * K:].reshape(L, HV, V)
+
+    if apply_l2norm:
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+
+    q = q.to(dtype)
+    k = k.to(dtype)
+
+    x = a.float() + dt_bias.float()
+    g = -torch.exp(A_log.float()) * F.softplus(x)
+    if output_g_exp:
+        g = torch.exp(g)
+
+    beta = torch.sigmoid(b.float())
+    return q, k, v, g, beta
 
 
 def fi_chunk_gated_delta_rule(
@@ -678,6 +731,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
+        if _GDN_DBG_ENABLED and self.layer_idx == 0:
+            pass
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
@@ -732,11 +787,20 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         3. Output projection
         """
         num_tokens = hidden_states.size(0)
+
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)
+
+        # DEBUG: trace NaN in TP>1
+        if self.layer_idx == 0 and self.tp_size > 1:
+            import logging as _lg
+            _l = _lg.getLogger(__name__)
+            _l.warning("GDN_DBG L0 hidden_nan=%s qkvz_nan=%s ba_nan=%s qkvz_norm=%.4f",
+                       hidden_states.isnan().any().item(), mixed_qkvz.isnan().any().item(),
+                       ba.isnan().any().item(), mixed_qkvz.float().norm().item())
 
         if self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout
@@ -757,6 +821,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             b = b.contiguous()
             a = a.contiguous()
 
+        # GDN forward debug (fires when _GDN_DBG_ENABLED is True)
+
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
@@ -776,6 +842,13 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             fast_kernel=False,
             layer_name=_encode_layer_name(self.prefix),
         )
+
+        # DEBUG: trace NaN after core attention
+        if self.layer_idx == 0 and self.tp_size > 1:
+            import logging as _lg
+            _l = _lg.getLogger(__name__)
+            _l.warning("GDN_DBG L0 core_nan=%s core_norm=%.4f",
+                       core_attn_out.isnan().any().item(), core_attn_out.float().norm().item())
 
         # ============================================================
         # Part 3: Output Projection
@@ -1189,6 +1262,10 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 a_non_spec = a
                 b_non_spec = b
 
+            if _GDN_DBG_ENABLED and self.layer_idx == 0:
+                import sys
+                V_OFF = 2 * (self.num_k_heads // self.tp_size) * self.head_k_dim
+            # fused_post_conv_prep Triton kernel is correct on SM70.
             (
                 query_non_spec,
                 key_non_spec,
@@ -1252,6 +1329,16 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()  # type: ignore[index]
             assert has_initial_state is not None
             initial_state[~has_initial_state, ...] = 0  # type: ignore[operator]
+            if _GDN_DBG_ENABLED and self.layer_idx == 0:
+                import sys, os
+                save_path = '/home/ice/llm/tmp/cdr_inputs_l0.pt'
+                if not os.path.exists(save_path):
+                    torch.save({
+                        'q': query_non_spec.cpu(), 'k': key_non_spec.cpu(),
+                        'v': value_non_spec.cpu(), 'g': g_non_spec.cpu(),
+                        'beta': beta_non_spec.cpu(), 'initial_state': initial_state.cpu(),
+                        'cu_seqlens': non_spec_query_start_loc.cpu(),
+                    }, save_path)
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1268,6 +1355,10 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
             )
+            if _GDN_DBG_ENABLED and self.layer_idx == 0:
+                import sys
+                T = core_attn_out_non_spec.shape[1]
+                last = T - 1
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype

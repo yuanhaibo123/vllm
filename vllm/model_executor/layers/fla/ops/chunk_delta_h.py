@@ -14,7 +14,7 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp
-from .utils import FLA_CHUNK_SIZE, use_cuda_graph
+from .utils import FLA_CHUNK_SIZE, filter_autotune_configs_sm70, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
 
@@ -30,12 +30,12 @@ NUM_WARPS = [2, 4, 8, 16]
     }
 )
 @triton.autotune(
-    configs=[
+    configs=filter_autotune_configs_sm70([
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
         for BV in [32, 64]
-    ],
+    ]),
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,
 )

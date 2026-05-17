@@ -7,9 +7,171 @@
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
+
+def _is_sm70_device(device: torch.device) -> bool:
+    """Return True on sm70 (NVIDIA Titan V / V100) where Triton conv1d is broken."""
+    if device.type != "cuda":
+        return False
+    props = torch.cuda.get_device_properties(device)
+    return props.major == 7 and props.minor == 0
+
+
+def _causal_conv1d_fn_pytorch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: "torch.Tensor | None",
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: "torch.Tensor | None" = None,
+    has_initial_state: "torch.Tensor | None" = None,
+    activation: "str | None" = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    **kwargs,
+) -> torch.Tensor:
+    """Pure-PyTorch fallback for causal_conv1d_fn (sm70 compatibility).
+
+    x: [dim, cu_seqlen] channel-last (stride(0)==1)
+    weight: [dim, width]
+    conv_states: [num_cache_lines, dim, width-1]
+    query_start_loc: [batch+1] int32
+    cache_indices: [batch] int32
+    has_initial_state: [batch] bool
+    """
+    original_dtype = x.dtype
+    x_f = x.float()
+    w_f = weight.float()
+    b_f = bias.float() if bias is not None else None
+
+    dim, _ = x.shape
+    width = weight.shape[1]
+    state_len = width - 1
+    batch = query_start_loc.size(0) - 1
+    out = torch.empty_like(x_f)
+
+    for b in range(batch):
+        start = int(query_start_loc[b].item())
+        end = int(query_start_loc[b + 1].item())
+        seqlen = end - start
+
+        slot = int(cache_indices[b].item()) if cache_indices is not None else b
+        if slot == pad_slot_id:
+            continue
+
+        use_initial = (
+            has_initial_state is not None and bool(has_initial_state[b].item())
+        )
+        if use_initial:
+            initial = conv_states[slot].float()  # [dim, state_len]
+        else:
+            initial = torch.zeros(dim, state_len, device=x.device, dtype=torch.float32)
+
+        x_seq = x_f[:, start:end]  # [dim, seqlen]
+        x_padded = torch.cat([initial, x_seq], dim=1)  # [dim, state_len + seqlen]
+
+        # Grouped (depthwise) conv1d
+        conv_out = F.conv1d(
+            x_padded.unsqueeze(0),  # [1, dim, state_len+seqlen]
+            w_f.unsqueeze(1),        # [dim, 1, width]
+            bias=b_f,
+            groups=dim,
+        ).squeeze(0)  # [dim, seqlen]
+
+        if activation in ("silu", "swish"):
+            conv_out = F.silu(conv_out)
+
+        out[:, start:end] = conv_out
+
+        # Update conv state: last state_len tokens of the INPUT (pre-activation)
+        if seqlen >= state_len:
+            conv_states[slot] = x_seq[:, -state_len:].to(conv_states.dtype)
+        else:
+            conv_states[slot, :, :state_len - seqlen] = (
+                initial[:, seqlen:].to(conv_states.dtype)
+            )
+            conv_states[slot, :, state_len - seqlen:] = x_seq.to(conv_states.dtype)
+
+    return out.to(original_dtype)
+
+
+def _causal_conv1d_update_pytorch(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: "torch.Tensor | None" = None,
+    activation: "bool | str | None" = None,
+    conv_state_indices: "torch.Tensor | None" = None,
+    num_accepted_tokens: "torch.Tensor | None" = None,
+    query_start_loc: "torch.Tensor | None" = None,
+    max_query_len: int = -1,
+    null_block_id: int = NULL_BLOCK_ID,
+    **kwargs,
+) -> torch.Tensor:
+    """Pure-PyTorch fallback for causal_conv1d_update (sm70 compatibility).
+
+    Handles the standard single-decode-token case:
+      x: [batch, dim] or [batch, dim, seqlen]
+    conv_state: [num_cache_lines, dim, width-1]
+    weight: [dim, width]
+    """
+    if isinstance(activation, bool):
+        activation = "silu" if activation else None
+
+    original_dtype = x.dtype
+    was_2d = (x.dim() == 2)
+    if was_2d:
+        x = x.unsqueeze(-1)  # [batch, dim, 1]
+
+    batch, dim, seqlen = x.shape
+    width = weight.shape[1]
+    state_len = width - 1
+
+    w_f = weight.float()
+    b_f = bias.float() if bias is not None else None
+
+    out = x  # in-place: result is written back to x
+
+    for b in range(batch):
+        slot = int(conv_state_indices[b].item()) if conv_state_indices is not None else b
+        if slot < 0:  # PAD_SLOT_ID (-1) indicates a padded/invalid entry
+            continue
+
+        state = conv_state[slot].float()  # [dim, state_len]
+        x_b = x[b].float()               # [dim, seqlen]
+
+        # Accepted-token handling for speculative decoding
+        if num_accepted_tokens is not None:
+            n_acc = int(num_accepted_tokens[b].item())
+            x_b = x_b[:, :n_acc]
+            eff_seqlen = n_acc
+        else:
+            eff_seqlen = seqlen
+
+        x_padded = torch.cat([state, x_b[:, :eff_seqlen]], dim=1)  # [dim, state_len+eff_seqlen]
+
+        conv_out = F.conv1d(
+            x_padded.unsqueeze(0),
+            w_f.unsqueeze(1),
+            bias=b_f,
+            groups=dim,
+        ).squeeze(0)  # [dim, eff_seqlen]
+
+        if activation in ("silu", "swish"):
+            conv_out = F.silu(conv_out)
+
+        out[b, :, :eff_seqlen] = conv_out.to(x.dtype)
+
+        # Update conv state (sliding window with input, pre-activation)
+        all_input = x_padded[:, eff_seqlen:]  # last state_len tokens of input
+        conv_state[slot] = all_input.to(conv_state.dtype)
+
+    if was_2d:
+        out = out.squeeze(-1)
+    return out.to(original_dtype)
 
 
 @triton.jit()
@@ -538,6 +700,17 @@ def causal_conv1d_fn(
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
+
+    # sm70 (Titan V / V100) workaround: the Triton prefill kernel silently
+    # produces zeros on compute capability 7.0.  Fall back to pure PyTorch.
+    if _is_sm70_device(x.device):
+        return _causal_conv1d_fn_pytorch(
+            x, weight, bias, conv_states, query_start_loc,
+            cache_indices=cache_indices,
+            has_initial_state=has_initial_state,
+            activation=activation,
+            pad_slot_id=pad_slot_id,
+        )
 
     args = None
     # Store original dtype to cast back at the end
@@ -1129,6 +1302,7 @@ def causal_conv1d_update(
     elif activation is not None:
         assert activation in ["silu", "swish"]
 
+    # causal_conv1d_update Triton kernel is correct on SM70 (verified exact).
     original_x_dtype = x.dtype
     x = x.to(conv_state.dtype)
     unsqueeze = query_start_loc is None and x.dim() == 2

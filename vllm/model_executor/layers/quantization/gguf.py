@@ -537,7 +537,10 @@ class GGUFLinearMethod(LinearMethodBase):
 
         if shard_id:
             # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            # For string shard ids (q/k/v), use canonical ["q","k","v"] order.
+            # For integer shard ids, sort ascending so output always matches
+            # the expected [shard0, shard1, ...] order regardless of GGUF load order.
+            shard_id = ["q", "k", "v"] if "q" in shard_id else sorted(shard_id)
             qweight = layer.qweight
             result = []
             for idx in shard_id:

@@ -218,10 +218,15 @@ class Qwen3_5Model(Qwen3NextModel):
         self.config = config
 
         self.vocab_size = config.vocab_size
+        quant_config = vllm_config.quant_config
+        self._is_gguf = type(quant_config).__name__ == "GGUFConfig"
+        logger.info("Qwen3_5Model: quant_config=%s, _is_gguf=%s", type(quant_config).__name__, self._is_gguf)
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):
@@ -339,6 +344,11 @@ class Qwen3_5Model(Qwen3NextModel):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                # Stacked path diagnostic
+                if self._is_gguf and "layers.3." in name:
+                    _lw = loaded_weight.float() if loaded_weight.is_floating_point() else loaded_weight.float()
+                    logger.info("[WLD-S] layers.3 stacked: %s[%s]  shape=%s  dtype=%s",
+                                name, shard_id, list(loaded_weight.shape), loaded_weight.dtype)
                 break
             else:
                 is_expert_weight = False
@@ -423,6 +433,23 @@ class Qwen3_5Model(Qwen3NextModel):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    # GGUF stores ssm_a as raw A (negative floats).
+                    # The HF parameter A_log = log(-A); apply the transform.
+                    if "linear_attn.A_log" in name and loaded_weight.is_floating_point() and (loaded_weight < 0).all():
+                        logger.info("A_log transform: pre=%.4f..%.4f → post=%.4f..%.4f",
+                                    loaded_weight.min().item(), loaded_weight.max().item(),
+                                    torch.log(-loaded_weight).min().item(), torch.log(-loaded_weight).max().item())
+                        loaded_weight = torch.log(-loaded_weight)
+                    # GemmaRMSNorm does: out = rms_norm(x) * (weight + 1)
+                    # GGUF stores the full multiplier (centered ~1.0).
+                    # HF stores the offset (centered ~0.0).
+                    # Subtract 1 to convert GGUF → HF convention.
+                    # Exclude linear_attn.norm.weight: that's RMSNormGated
+                    # which uses weight directly (no +1).
+                    if ("norm.weight" in name and self._is_gguf
+                            and "linear_attn.norm.weight" not in name
+                            and loaded_weight.is_floating_point()):
+                        loaded_weight = loaded_weight - 1.0
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
@@ -431,6 +458,7 @@ class Qwen3_5Model(Qwen3NextModel):
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
+    IsHybrid,
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
@@ -515,12 +543,142 @@ class Qwen3_5ForCausalLMBase(
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: "VllmConfig",
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: "VllmConfig"
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=["mtp."],
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        self._assert_gdn_weight_shapes()
+        return loaded
+
+    def _assert_gdn_weight_shapes(self) -> None:
+        """Check that loaded GDN weight shapes match the config.
+
+        Runs once at load time — zero inference overhead.
+        Catches config/weight mismatches (e.g. wrong ssm_inner_size, wrong
+        num_value_heads) that would otherwise silently produce garbage output.
+        """
+        from vllm.model_executor.layers.mamba.gdn_linear_attn import (
+            GatedDeltaNetAttention,
+        )
+
+        cfg = self.config
+        # Find the first GDN layer to check against.
+        gdn_layer = None
+        for layer in self.model.layers:
+            if hasattr(layer, "linear_attn") and isinstance(
+                layer.linear_attn, GatedDeltaNetAttention
+            ):
+                gdn_layer = layer.linear_attn
+                break
+
+        if gdn_layer is None:
+            return  # no GDN layers (pure MHA model), nothing to check
+
+        tp = gdn_layer.tp_size
+        expected_value_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
+        expected_key_dim   = cfg.linear_num_key_heads  * cfg.linear_key_head_dim
+        # in_proj_qkvz output = Q_proj + K_proj + V_proj + Z_proj
+        #   = key_dim + key_dim + value_dim + value_dim  (q=k dim, z=v dim)
+        expected_qkvz_out = (expected_key_dim * 2 + expected_value_dim * 2) // tp
+
+        errors = []
+
+        def _param_shape(module, param_name: str):
+            """Get parameter shape via get_parameter (works on parallel linears)."""
+            try:
+                return module.get_parameter(param_name).shape
+            except AttributeError:
+                return None
+
+        # Check in_proj_qkvz output dim via stored output_size attribute
+        # (MergedColumnParallelLinear has no .weight, but stores output_size)
+        if hasattr(gdn_layer, "in_proj_qkvz"):
+            proj = gdn_layer.in_proj_qkvz
+            actual_out = getattr(proj, "output_size_per_partition",
+                          getattr(proj, "output_size", None))
+            if actual_out is not None and actual_out != expected_qkvz_out:
+                errors.append(
+                    f"in_proj_qkvz output dim: {actual_out}, "
+                    f"config implies {expected_qkvz_out} "
+                    f"(num_k_heads={cfg.linear_num_key_heads}, "
+                    f"head_k_dim={cfg.linear_key_head_dim}, "
+                    f"num_v_heads={cfg.linear_num_value_heads}, "
+                    f"head_v_dim={cfg.linear_value_head_dim}, tp={tp})"
+                )
+
+        # Check out_proj input dim = value_dim / tp
+        if hasattr(gdn_layer, "out_proj"):
+            shape = _param_shape(gdn_layer.out_proj, "weight")
+            if shape is not None:
+                actual_in = shape[1]
+                expected_in = expected_value_dim // tp
+                if actual_in != expected_in:
+                    errors.append(
+                        f"out_proj input dim: weight has {actual_in}, "
+                        f"config implies {expected_in} "
+                        f"(num_v_heads={cfg.linear_num_value_heads}, "
+                        f"head_v_dim={cfg.linear_value_head_dim}, tp={tp})"
+                    )
+
+        # Check A_log length = num_v_heads / tp
+        if hasattr(gdn_layer, "A_log"):
+            actual_len = gdn_layer.A_log.shape[0]
+            expected_len = cfg.linear_num_value_heads // tp
+            if actual_len != expected_len:
+                errors.append(
+                    f"A_log length: {actual_len}, "
+                    f"config implies {expected_len} "
+                    f"(linear_num_value_heads={cfg.linear_num_value_heads}, tp={tp})"
+                )
+
+        if errors:
+            raise RuntimeError(
+                "GDN weight shape mismatch — config fields do not match "
+                "the loaded weights. This usually means GGUF metadata was "
+                "not applied correctly to the HF config.\n"
+                + "\n".join(f"  • {e}" for e in errors)
+            )
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):

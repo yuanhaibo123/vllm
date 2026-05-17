@@ -27,6 +27,30 @@ FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 
 SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 
+
+def filter_autotune_configs_sm70(configs: list) -> list:
+    """Return SM70-safe autotune configs when running on Titan V / V100.
+
+    SM70 (Volta) does not support the async copy instructions that Triton
+    generates when num_stages >= 3.  Large block sizes (BK/BV > 32) also
+    trigger tensor-core paths that crash during autotuning.  Return a
+    small safe subset; falls back to the full list on SM80+.
+    """
+    try:
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability(0)
+            if cap == (7, 0):
+                safe = [
+                    c for c in configs
+                    if c.num_stages <= 2
+                    and c.kwargs.get("BK", 32) <= 32
+                    and c.kwargs.get("BV", 32) <= 32
+                ]
+                return safe if safe else [configs[0]]
+    except Exception:
+        pass
+    return configs
+
 # Default chunk size used across FLA triton kernels (kda, chunk, chunk_o, etc.)
 FLA_CHUNK_SIZE = 64
 

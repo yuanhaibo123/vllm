@@ -213,13 +213,18 @@ def mamba_v2_sharded_weight_loader(
             # - the ignore is for a mundane mypy error as it does not
             #   seem to handle slices well.
             # https://github.com/python/mypy/issues/2410
-            param.data[
-                boundary : (boundary + take), ...  # type: ignore[misc]
-            ] = loaded_weight[
+            loaded_slice = loaded_weight[
                 loaded_start_idx : (
                     loaded_start_idx + take
                 )  # type: ignore[misc]
-            ]  # type: ignore[misc]
+            ]
+            # GGUF conv1d weights arrive as 2D [out, kernel] but the param
+            # has been unsqueeze(1)'d to [out, 1, kernel]; insert that dim.
+            if param.data.dim() == 3 and loaded_slice.dim() == 2:
+                loaded_slice = loaded_slice.unsqueeze(1)
+            param.data[
+                boundary : (boundary + take), ...  # type: ignore[misc]
+            ] = loaded_slice  # type: ignore[misc]
 
             # move indexing boundaries
             boundary += shard_size

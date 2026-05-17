@@ -704,12 +704,43 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         # initialize GGUF param after we know the quantize type
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if isinstance(loaded_shard_id, tuple) and (
-            is_gguf_weight or is_gguf_weight_type
-        ):
-            raise NotImplementedError(
-                "Shard id with multiple indices is not supported for GGUF."
+        if isinstance(loaded_shard_id, tuple) and is_gguf_weight_type:
+            # Store the per-type value for each shard in the tuple.
+            for sid in loaded_shard_id:
+                param.data[sid].copy_(loaded_weight)
+                param.shard_weight_type[sid] = loaded_weight.item()
+            return
+        if isinstance(loaded_shard_id, tuple) and is_gguf_weight:
+            # Combined GGUF tensor (e.g. Q+K+V packed as attn_qkv in GDN layers).
+            # The tensor stores shards contiguously: [Q_all | K_all | V_all].
+            # We must split into per-shard blocks FIRST, then take each
+            # shard's TP slice — not a contiguous TP slice from the combined
+            # tensor which would cross shard boundaries.
+            output_dim = getattr(param, "output_dim", None)
+            total_rows = loaded_weight.size(output_dim)
+            total_out = sum(
+                self.output_sizes[i]
+                for i in range(loaded_shard_id[0], loaded_shard_id[-1] + 1)
             )
+            # Split combined tensor into per-shard blocks proportional to
+            # output_sizes (ratio is the same as full sizes since each is
+            # divided by tp_size).
+            block_sizes = [
+                round(self.output_sizes[i] * total_rows / total_out)
+                for i in range(loaded_shard_id[0], loaded_shard_id[-1] + 1)
+            ]
+            block_sizes[-1] = total_rows - sum(block_sizes[:-1])
+            blocks = torch.split(loaded_weight, block_sizes, dim=output_dim)
+            # Extract TP slice from each per-shard block.
+            for sid, block in zip(loaded_shard_id, blocks):
+                blk_rows = block.size(output_dim)
+                tp_shard = blk_rows // self.tp_size
+                start = self.tp_rank * tp_shard
+                frag = block.narrow(output_dim, start, tp_shard)
+                param.shard_id.append(sid)
+                param.shard_id_map[sid] = len(param.data_container)
+                param.data_container.append(frag)
+            return
         if is_gguf_weight_type:
             if loaded_shard_id is not None:
                 param.data[loaded_shard_id].copy_(loaded_weight)
@@ -1208,11 +1239,22 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
 
             if loaded_shard_id is not None:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                # Use head-based sharding, replicating KV heads across
+                # TPs when num_kv_heads < tp_size.
+                if loaded_shard_id == "q":
+                    shard_size = self.num_heads * self.head_size
+                    shard_rank = self.tp_rank
+                elif loaded_shard_id == "k":
+                    shard_size = self.num_kv_heads * self.head_size
+                    shard_rank = self.tp_rank // self.num_kv_head_replicas
+                else:  # "v"
+                    shard_size = self.num_kv_heads * self.v_head_size
+                    shard_rank = self.tp_rank // self.num_kv_head_replicas
+                start_idx = shard_rank * shard_size
+                loaded_weight = loaded_weight.narrow(
+                    output_dim, start_idx, shard_size)
                 param.shard_id.append(loaded_shard_id)
                 param.shard_id_map[loaded_shard_id] = len(param.data_container)
                 param.data_container.append(loaded_weight)
