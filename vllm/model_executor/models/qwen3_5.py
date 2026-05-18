@@ -73,6 +73,7 @@ from .interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -469,7 +470,9 @@ class Qwen3_5ForCausalLMBase(
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
+    SupportsMRoPE,
 ):
+    supports_mrope: typing.ClassVar[typing.Literal[True]] = True
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -604,7 +607,104 @@ class Qwen3_5ForCausalLMBase(
         )
         loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self._assert_gdn_weight_shapes()
+        self._compress_fp16_weights_to_int8()
         return loaded
+
+    def _compress_fp16_weights_to_int8(self) -> None:
+        """Post-load: compress unquantized fp16/bf16 attention and
+        lm_head/embed_tokens weight matrices to W8A16 int8 format.
+
+        Qwen3.5's GPTQ config uses '-:.*attn.*' which leaves ALL attention
+        projection matrices (linear_attn and self_attn) at bf16/fp16, plus
+        embed_tokens and lm_head are also stored as bf16.  On 12 GB Titan V
+        GPUs this occupies ~3.5 GiB of static VRAM per rank just for those
+        fp16 tensors.
+
+        This function replaces each eligible fp16 weight with an int8
+        equivalent (half the VRAM) and patches the layer's quant_method to
+        dequantize (int8 → fp16) just before the matmul.  Per-output-row
+        symmetric quantization stays in fp16 to avoid allocating float32
+        temporaries that would OOM (lm_head = 2.37 GiB fp16 → 4.74 GiB f32).
+        """
+        import types
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        n_compressed = 0
+        saved_bytes = 0
+
+        for mod_name, module in self.named_modules():
+            is_attn  = 'attn' in mod_name
+            # Keep lm_head/embed_tokens in fp16 — they are large (vocab × hidden)
+            # and dequantizing them on every forward pass would allocate a 1.46 GiB
+            # fp16 copy of lm_head on every token, blowing up the profile-run peak
+            # on PP3 and causing KV cache allocation to fail.  The static VRAM
+            # saving (0.73 GiB) is smaller than the runtime cost.
+            if not is_attn:
+                continue
+
+            w = getattr(module, 'weight', None)
+            if not (isinstance(w, torch.Tensor) and
+                    w.dtype in (torch.float16, torch.bfloat16) and
+                    w.dim() == 2):
+                continue
+
+            qm = getattr(module, 'quant_method', None)
+            if not isinstance(qm, UnquantizedLinearMethod):
+                continue
+
+            # All operations stay in the tensor's native dtype (fp16 or bf16)
+            # to avoid a 2× float32 intermediate.  The plan is:
+            #   1. Compute scale in-place (tiny vector: vocab_size floats)
+            #   2. Quantise in-place on the EXISTING weight buffer (no second copy)
+            #   3. Cast to int8 — only now do we allocate a NEW, half-sized buffer
+            #   4. Replace module.weight.data with the int8 tensor
+            #   5. Release the old fp16/bf16 tensor
+            # Peak additional VRAM = ½ × original (for the int8 output only).
+            w_orig = module.weight.data              # fp16 or bf16, [out, in]
+            dtype_orig = w_orig.dtype
+            eps_val = torch.finfo(dtype_orig).tiny    # safe floor for fp16/bf16
+
+            scale = w_orig.abs().amax(dim=1)          # [out], same dtype, tiny
+            scale.clamp_(min=eps_val).div_(127.0)     # in-place
+            w_orig.div_(scale[:, None]).round_().clamp_(-128.0, 127.0)  # in-place
+            w_int8 = w_orig.to(torch.int8)            # allocate int8 (½ size)
+
+            saved_bytes += module.weight.data.numel() # 1 byte saved per element
+
+            module.weight.data = w_int8
+            del w_orig, w_int8  # drop refs; original fp16/bf16 tensor is now free
+            module.register_buffer('_w_int8_scale',
+                                   scale.to(torch.float16),
+                                   persistent=False)
+            del scale
+
+            # Patch apply() — used for attention linear matmuls.
+            # Use in-place mul_ after the int8→fp16 cast to avoid a second
+            # full-sized fp16 copy (double peak VRAM).
+            def _make_apply_patch():
+                def patched_apply(method_self, layer, x, bias=None):
+                    w_fp = layer.weight.to(x.dtype)          # int8→fp16 (one copy)
+                    w_fp.mul_(layer._w_int8_scale[:, None])  # in-place scale
+                    return torch.nn.functional.linear(x, w_fp, bias)
+                return patched_apply
+            qm.apply = types.MethodType(_make_apply_patch(), qm)
+
+            n_compressed += 1
+
+        torch.cuda.empty_cache()
+        # Reset the CUDA peak-memory watermark so that DeviceMemoryProfiler
+        # (which reads torch.cuda.max_memory_allocated) sees the actual
+        # post-compression weight size rather than the brief fp16+int8
+        # coexistence peak.  Without this, model_memory_usage is over-reported
+        # by ~the compression savings, which makes available_kv_cache_memory
+        # come out negative and crash KV cache allocation.
+        torch.cuda.reset_peak_memory_stats()
+        saved_gib = saved_bytes / 1024 ** 3
+        logger.info(
+            "INT8 weight compression: %d tensor(s) fp16→int8, "
+            "saving ~%.2f GiB static VRAM on this rank.",
+            n_compressed, saved_gib,
+        )
 
     def _assert_gdn_weight_shapes(self) -> None:
         """Check that loaded GDN weight shapes match the config.
@@ -697,7 +797,15 @@ class Qwen3_5ForCausalLMBase(
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
-    pass
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list,
+    ) -> tuple[torch.Tensor, int]:
+        import numpy as np
+        n = len(input_tokens)
+        positions = np.broadcast_to(np.arange(n, dtype=np.int64), (3, n)).copy()
+        return torch.from_numpy(positions), 0
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):

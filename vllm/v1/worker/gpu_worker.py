@@ -446,6 +446,19 @@ class Worker(WorkerBase):
             - cudagraph_memory_estimate_applied
         )
 
+        from vllm.distributed import get_pp_group
+        logger.info(
+            "[PP rank %d] Memory breakdown: weights=%.3f GiB, "
+            "non_torch=%.3f GiB, torch_peak=%.3f GiB, "
+            "non_kv_cache=%.3f GiB, available_kv=%.3f GiB",
+            get_pp_group().rank_in_group,
+            profile_result.weights_memory / 1024**3,
+            profile_result.non_torch_increase / 1024**3,
+            profile_result.torch_peak_increase / 1024**3,
+            profile_result.non_kv_cache_memory / 1024**3,
+            self.available_kv_cache_memory_bytes / 1024**3,
+        )
+
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",

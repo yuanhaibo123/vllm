@@ -3166,8 +3166,15 @@ class GPUModelRunner(
                     local_len = num_tokens // tp
                     v = get_tp_group().all_gather(v[:local_len], dim=0)
 
-                self.intermediate_tensors[k][:num_tokens].copy_(
-                    v[:num_tokens], non_blocking=True
+                # v may have fewer rows than num_tokens when the sending PP
+                # rank returned unpadded intermediate tensors (e.g. chunked
+                # prefill with PP where PP0 returns real-token-count tensors
+                # but this rank's num_tokens is padded to a larger bucket).
+                # Copy only what was sent; padding positions are masked by
+                # attention and do not affect the output.
+                src_len = v.shape[0]
+                self.intermediate_tensors[k][:src_len].copy_(
+                    v, non_blocking=True
                 )
 
         return IntermediateTensors(
@@ -6295,9 +6302,9 @@ class GPUModelRunner(
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
 
-        # Lock workspace to prevent resizing during execution.
-        # Max workspace sizes should have been captured during warmup/profiling.
-        lock_workspace()
+        # NOTE: Workspace locking disabled — turboquant prefill path needs
+        # larger workspace than CUDA graph capture shapes can exercise.
+        # lock_workspace()
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time

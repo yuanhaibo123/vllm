@@ -654,17 +654,25 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         max_seqlen_k=q_len,
                     )
                 else:
-                    q_t = q_seq.transpose(0, 1).contiguous()
-                    k_t = k_seq.transpose(0, 1).contiguous()
-                    v_t = v_seq.transpose(0, 1).contiguous()
+                    # On SM70, enable_gqa=True forces the math backend
+                    # (O(N²) memory). Use 4D + expanded heads to route
+                    # to the cutlass mem_efficient backend (O(N) memory,
+                    # flash-attention algorithm).
+                    q_4d = q_seq.transpose(0, 1).unsqueeze(0)  # (1,Hq,N,D)
+                    if use_gqa:
+                        gqa_ratio = self.num_heads // self.num_kv_heads
+                        k_4d = k_seq.transpose(0, 1).unsqueeze(0).repeat_interleave(gqa_ratio, dim=1)
+                        v_4d = v_seq.transpose(0, 1).unsqueeze(0).repeat_interleave(gqa_ratio, dim=1)
+                    else:
+                        k_4d = k_seq.transpose(0, 1).unsqueeze(0)
+                        v_4d = v_seq.transpose(0, 1).unsqueeze(0)
                     out = F.scaled_dot_product_attention(
-                        q_t,
-                        k_t,
-                        v_t,
+                        q_4d,
+                        k_4d,
+                        v_4d,
                         is_causal=True,
                         scale=self.scale,
-                        enable_gqa=use_gqa,
-                    ).transpose(0, 1)
+                    ).squeeze(0).transpose(0, 1)
                 output[q_start:q_end] = out.to(query.dtype)
             else:
                 # Continuation chunk: tokens already stored to TQ cache
@@ -836,22 +844,32 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=seq_len,
             )
         else:
-            # SDPA fallback: expand KV for GQA, build causal mask
-            q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
-            k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            # Build causal mask: query position p can attend to K position j
-            # where j <= cached_len + p (p is 0-indexed within chunk)
+            # SM70 SDPA fallback for continuation prefill.
+            # enable_gqa=True with Hq≠Hk forces PyTorch's math backend which
+            # materializes a full (Hq, q_len, seq_len) attention matrix.
+            # At 16K context: 24 × 4096 × 16384 × 4B = 6.44 GiB → OOM.
+            # Fix: expand KV heads to Hq (equal heads) and use a float additive
+            # bias instead of a bool mask → routes to cutlass mem_efficient
+            # (O(N) memory, flash-attn algorithm).
+            gqa_ratio = Hq // Hk
+            q_t = query.transpose(0, 1).unsqueeze(0)         # (1, Hq, q_len, D)
+            k_t = (k_full.transpose(0, 1).unsqueeze(0)
+                   .repeat_interleave(gqa_ratio, dim=1))      # (1, Hq, seq_len, D)
+            v_t = (v_full.transpose(0, 1).unsqueeze(0)
+                   .repeat_interleave(gqa_ratio, dim=1))      # (1, Hq, seq_len, D)
+            # Causal bias: 0 where query can attend, -inf where blocked.
+            # Shape (1, 1, q_len, seq_len) broadcasts across batch and heads.
             q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
             k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            mask = k_pos <= q_pos  # (q_len, seq_len)
+            causal_bool = (k_pos <= q_pos).unsqueeze(0).unsqueeze(0)  # (1,1,q_len,seq_len)
+            attn_bias = torch.zeros(1, 1, q_len, seq_len,
+                                    dtype=query.dtype, device=device)
+            attn_bias.masked_fill_(~causal_bool, float('-inf'))
+            del causal_bool
             out = F.scaled_dot_product_attention(
-                q_t,
-                k_t,
-                v_t,
-                attn_mask=mask,
+                q_t, k_t, v_t,
+                attn_mask=attn_bias,
                 scale=self.scale,
-                enable_gqa=(Hk < Hq),
             )  # (1, Hq, q_len, D)
             return out[0].transpose(0, 1)  # (q_len, Hq, D)
 
