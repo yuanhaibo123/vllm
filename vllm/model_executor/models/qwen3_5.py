@@ -94,6 +94,7 @@ from .qwen3_vl import (
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     is_pp_missing_parameter,
@@ -222,12 +223,18 @@ class Qwen3_5Model(Qwen3NextModel):
         self._is_gguf = type(quant_config).__name__ == "GGUFConfig"
         logger.info("Qwen3_5Model: quant_config=%s, _is_gguf=%s", type(quant_config).__name__, self._is_gguf)
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
-        )
+        # Only allocate embed_tokens on the first PP rank — it is never used
+        # on middle/last ranks (forward receives hidden_states from prev rank),
+        # but previously wasted 2.37 GiB of VRAM on every worker.
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         def get_layer(prefix: str):
             return Qwen3_5DecoderLayer(
@@ -582,12 +589,20 @@ class Qwen3_5ForCausalLMBase(
     ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
+    # VL checkpoints store text weights under model.language_model.*
+    # but the text-only model expects model.*. Map the prefix.
+    # Named hf_to_vllm_mapper so configure_quant_config picks it up
+    # and fixes GPTQ layer detection (strips model.language_model. prefix).
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"model.language_model.": "model."}
+    )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
-            skip_prefixes=["mtp."],
+            skip_prefixes=["mtp.", "model.visual."],
         )
-        loaded = loader.load_weights(weights)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         self._assert_gdn_weight_shapes()
         return loaded
 

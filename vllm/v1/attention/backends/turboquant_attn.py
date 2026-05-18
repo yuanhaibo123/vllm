@@ -57,7 +57,10 @@ from vllm.v1.worker.workspace import (
     is_workspace_manager_initialized,
 )
 
-_HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
+_HAS_FLASH_ATTN = is_flash_attn_varlen_func_available() and (
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] >= 8  # FA2 requires Ampere+
+)
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 

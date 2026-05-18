@@ -207,63 +207,19 @@ class GGUFModelLoader(BaseModelLoader):
             "qwen3_5_text": "qwen35",
             "qwen3_5_moe_text": "qwen35moe",
         }
-        # Qwen3.5 hybrid SSM/attention: fix tensor name mappings and
-        # set all SSM config fields directly from GGUF metadata (the
-        # single source of truth), mirroring how llama.cpp derives
-        # dimensions in qwen35.cpp::load_arch_hparams/load_arch_tensors.
+
+        # Qwen3.5/3.6 GGUF is not supported: the GGUF format stores
+        # V-head-indexed tensors in GQA-grouped order when num_v_heads !=
+        # num_k_heads (e.g. 4B: nk=16 nv=32, 27B: nk=16 nv=48). This
+        # produces incorrect output.  Use the HuggingFace checkpoint instead.
         if model_type in ("qwen3_5_text", "qwen3_5"):
-            # 1. Tensor name fixes: auto-map fails for dt_bias and A_log
-            for idx in range(text_config.num_hidden_layers):
-                gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
-                    f"model.layers.{idx}.linear_attn.dt_bias"
-                )
-                gguf_to_hf_name_map[f"blk.{idx}.ssm_a"] = (
-                    f"model.layers.{idx}.linear_attn.A_log"
-                )
-            # 2. Read all SSM dimensions from GGUF metadata and set them
-            #    on the config, exactly like llama.cpp does:
-            #      ssm.group_count    → n_k_heads  (linear_num_key_heads)
-            #      ssm.time_step_rank → n_v_heads  (linear_num_value_heads)
-            #      ssm.state_size     → head_k_dim (linear_key_head_dim)
-            #      ssm.inner_size     → value_dim  (ssm_inner_size)
-            #      ssm.conv_kernel    → conv_dim   (linear_conv_kernel_dim)
-            #      linear_value_head_dim = ssm_inner_size / n_v_heads
-            _reader = gguf.GGUFReader(model_config.model)
-            _arch = "qwen35"
-
-            def _gguf_int(field_name: str) -> int | None:
-                k = f"{_arch}.{field_name}"
-                if k in _reader.fields:
-                    return int(_reader.fields[k].parts[-1][0])
-                return None
-
-            _field_map: list[tuple[str, str]] = [
-                ("ssm.group_count",    "linear_num_key_heads"),
-                ("ssm.time_step_rank", "linear_num_value_heads"),
-                ("ssm.state_size",     "linear_key_head_dim"),
-                ("ssm.inner_size",     "ssm_inner_size"),
-                ("ssm.conv_kernel",    "linear_conv_kernel_dim"),
-                ("attention.key_length", "head_dim"),
-            ]
-            for gguf_field, hf_attr in _field_map:
-                val = _gguf_int(gguf_field)
-                if val is not None:
-                    old = getattr(text_config, hf_attr, None)
-                    if old != val:
-                        logger.info("GGUF → %s = %d (was %s)",
-                                    hf_attr, val, old)
-                    setattr(text_config, hf_attr, val)
-
-            # Derived: linear_value_head_dim = ssm_inner_size / n_v_heads
-            _inner = getattr(text_config, "ssm_inner_size", None)
-            _nvh = getattr(text_config, "linear_num_value_heads", None)
-            if _inner and _nvh:
-                vhd = _inner // _nvh
-                old = getattr(text_config, "linear_value_head_dim", None)
-                if old != vhd:
-                    logger.info("GGUF → linear_value_head_dim = %d (was %s)",
-                                vhd, old)
-                text_config.linear_value_head_dim = vhd
+            raise ValueError(
+                "Loading Qwen3.5/Qwen3.6 from a GGUF file is not supported. "
+                "The GGUF format stores V-head tensors in GQA-grouped order "
+                "when num_v_heads != num_k_heads, which causes incorrect "
+                "inference output. Please use the HuggingFace format model "
+                "instead (e.g. Qwen/Qwen3.5-4B or Qwen/Qwen3.6-27B)."
+            )
 
         model_type = _HF_TO_GGUF_MODEL_TYPE.get(model_type, model_type)
 
