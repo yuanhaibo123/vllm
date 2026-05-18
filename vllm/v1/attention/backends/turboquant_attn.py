@@ -599,7 +599,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         query_start_loc = attn_metadata.query_start_loc
         num_reqs = query_start_loc.shape[0] - 1
 
-        output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
+        output = torch.empty(N, Hq, D, device=query.device, dtype=query.dtype)
 
         # Prefer the CPU-resident copies from the metadata if populated —
         # otherwise `.tolist()` on GPU tensors forces a synchronizing copy.
@@ -851,27 +851,44 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # Fix: expand KV heads to Hq (equal heads) and use a float additive
             # bias instead of a bool mask → routes to cutlass mem_efficient
             # (O(N) memory, flash-attn algorithm).
+            #
+            # VRAM optimisation: expand one KV-head group (gqa_ratio heads) at a
+            # time rather than materialising all Hq heads at once.
+            # At 32K, this reduces peak K/V scratch from 2×(Hq×s×D×2B)=768 MB
+            # to 2×(gqa_ratio×s×D×2B)=192 MB — saving ~576 MB per call.
             gqa_ratio = Hq // Hk
-            q_t = query.transpose(0, 1).unsqueeze(0)         # (1, Hq, q_len, D)
-            k_t = (k_full.transpose(0, 1).unsqueeze(0)
-                   .repeat_interleave(gqa_ratio, dim=1))      # (1, Hq, seq_len, D)
-            v_t = (v_full.transpose(0, 1).unsqueeze(0)
-                   .repeat_interleave(gqa_ratio, dim=1))      # (1, Hq, seq_len, D)
-            # Causal bias: 0 where query can attend, -inf where blocked.
-            # Shape (1, 1, q_len, seq_len) broadcasts across batch and heads.
+            q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
+            # Causal bias built once; shape (1,1,q_len,seq_len) broadcasts
+            # across all KV groups in the loop below.
             q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
             k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            causal_bool = (k_pos <= q_pos).unsqueeze(0).unsqueeze(0)  # (1,1,q_len,seq_len)
+            causal_bool = (k_pos <= q_pos).unsqueeze(0).unsqueeze(0)  # (1,1,q,s)
             attn_bias = torch.zeros(1, 1, q_len, seq_len,
                                     dtype=query.dtype, device=device)
             attn_bias.masked_fill_(~causal_bool, float('-inf'))
-            del causal_bool
-            out = F.scaled_dot_product_attention(
-                q_t, k_t, v_t,
-                attn_mask=attn_bias,
-                scale=self.scale,
-            )  # (1, Hq, q_len, D)
-            return out[0].transpose(0, 1)  # (q_len, Hq, D)
+            del causal_bool, q_pos, k_pos
+            # Permute to (Hk, seq_len, D) so each KV-head slice is contiguous.
+            k_heads = k_full.permute(1, 0, 2).contiguous()  # (Hk, s, D)
+            v_heads = v_full.permute(1, 0, 2).contiguous()  # (Hk, s, D)
+            del k_full, v_full
+            out_all = torch.empty(1, Hq, q_len, D,
+                                  dtype=query.dtype, device=device)
+            for kv_i in range(Hk):
+                # k_heads[kv_i] is (s, D) contiguous — unsqueeze + expand
+                # then contiguous() materialises one group: gqa_ratio×s×D×2B.
+                k_h = (k_heads[kv_i].unsqueeze(0).unsqueeze(0)
+                       .expand(1, gqa_ratio, -1, -1).contiguous())  # (1,R,s,D)
+                v_h = (v_heads[kv_i].unsqueeze(0).unsqueeze(0)
+                       .expand(1, gqa_ratio, -1, -1).contiguous())  # (1,R,s,D)
+                q_g = q_t[:, kv_i * gqa_ratio : (kv_i + 1) * gqa_ratio
+                          ].contiguous()  # (1, R, q_len, D)
+                out_all[:, kv_i * gqa_ratio : (kv_i + 1) * gqa_ratio] = (
+                    F.scaled_dot_product_attention(
+                        q_g, k_h, v_h, attn_mask=attn_bias, scale=self.scale
+                    )
+                )
+                del k_h, v_h, q_g
+            return out_all[0].transpose(0, 1)  # (q_len, Hq, D)
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
