@@ -3,11 +3,21 @@
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final
+
+# Server-level default thinking token budget (hard enforcement via SamplingParams).
+# Set VLLM_DEFAULT_THINKING_TOKEN_BUDGET env var to enforce a cap on all requests
+# when no per-request thinking_token_budget is provided.
+_DEFAULT_THINKING_TOKEN_BUDGET: int | None = (
+    int(os.environ["VLLM_DEFAULT_THINKING_TOKEN_BUDGET"])
+    if "VLLM_DEFAULT_THINKING_TOKEN_BUDGET" in os.environ
+    else None
+)
 
 from fastapi import Request
 
@@ -307,6 +317,14 @@ class OpenAIServingChat(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                # Hard-enforce thinking budget when set server-wide and the
+                # request doesn't specify one.
+                if (
+                    isinstance(sampling_params, SamplingParams)
+                    and sampling_params.thinking_token_budget is None
+                    and _DEFAULT_THINKING_TOKEN_BUDGET is not None
+                ):
+                    sampling_params.thinking_token_budget = _DEFAULT_THINKING_TOKEN_BUDGET
 
             self._log_inputs(
                 sub_request_id,

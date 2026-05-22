@@ -525,4 +525,35 @@ class ThinkingBudgetStateHolder:
                 force_tokens = self.force_token_ids[active_indices]
                 logits[active_indices, force_tokens] = 1e9
 
+        # Soft logit nudge: gradually boost </think> token as budget runs low.
+        # This lets the model conclude naturally before the hard force triggers.
+        # Nudge schedule (fraction of budget remaining → logit bonus):
+        #   >20% remaining  → +0 (no nudge)
+        #   20% → 10%        → linearly +0 to +3
+        #   <10% remaining  → +3 to +8 (steeper ramp)
+        if self.think_end_token_ids:
+            end_tok = self.think_end_token_ids[0]
+            for seq_idx, state in self._state.items():
+                if state.get("in_end", False):
+                    continue  # already forcing, skip nudge
+                if not state.get("in_think", False):
+                    continue
+                budget = state.get("thinking_token_budget", 0)
+                think_count = state.get("think_count", 0)
+                if budget <= 0:
+                    continue
+                remaining_frac = max(0.0, (budget - think_count) / budget)
+                if remaining_frac > 0.20:
+                    continue
+                # Linear ramp: 0.20→0.10 = +0 to +3; 0.10→0.0 = +3 to +8
+                if remaining_frac > 0.10:
+                    bonus = 3.0 * (0.20 - remaining_frac) / 0.10
+                else:
+                    bonus = 3.0 + 5.0 * (0.10 - remaining_frac) / 0.10
+                if seq_idx not in self.cu_num_tokens:
+                    continue
+                row = self.cu_num_tokens[seq_idx]
+                if row < logits.shape[0]:
+                    logits[row, end_tok] += bonus
+
         return logits
