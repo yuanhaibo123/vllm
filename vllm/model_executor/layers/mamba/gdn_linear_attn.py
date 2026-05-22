@@ -8,7 +8,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 # Debug flag: set to True from outside to print GDN forward diagnostics once
-_GDN_DBG_ENABLED: bool = True
+_GDN_DBG_ENABLED: bool = False
 
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops

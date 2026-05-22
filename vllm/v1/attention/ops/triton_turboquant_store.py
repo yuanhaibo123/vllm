@@ -45,13 +45,29 @@ def _store_quantized_value(
         val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(
             tl.float32
         )
-        val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
-        val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
-        v_scale = (val_max - val_min) / 7.0
-        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+
+        # Group=32: vectorized min/max via reshape [N_GROUPS, 32]
+        N_GROUPS: tl.constexpr = D // 32
+        val_2d = tl.reshape(val_vec, [N_GROUPS, BLOCK_D // N_GROUPS])
+        g_mins = tl.min(val_2d, axis=1)  # [N_GROUPS]
+        g_maxs = tl.max(val_2d, axis=1)  # [N_GROUPS]
+        g_scales = (g_maxs - g_mins) / 7.0
+        g_scales = tl.where(g_scales > 1e-8, g_scales, 1e-8)
+
+        # Broadcast back to per-element: d_offs // 32 picks the group
+        g_idx = d_offs // 32
+        g_scale_vec = tl.load(
+            tl.make_block_ptr(g_scales, shape=[N_GROUPS], strides=[1], offsets=[0], block_shape=[N_GROUPS], order=[0]),
+        ) if False else g_scales  # workaround: use gather
+        # Triton doesn't support fancy indexing of 1D vectors by 1D vectors simply,
+        # so broadcast via reshape: [N_GROUPS, 1] * ones -> [N_GROUPS, 32] -> flatten
+        g_scale_2d = g_scales[:, None] + tl.zeros([N_GROUPS, BLOCK_D // N_GROUPS], dtype=tl.float32)
+        g_min_2d = g_mins[:, None] + tl.zeros([N_GROUPS, BLOCK_D // N_GROUPS], dtype=tl.float32)
+        g_scale_flat = tl.reshape(g_scale_2d, [BLOCK_D])
+        g_min_flat = tl.reshape(g_min_2d, [BLOCK_D])
 
         q_vals = tl.minimum(
-            tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 7
+            tl.maximum(((val_vec - g_min_flat) / g_scale_flat + 0.5).to(tl.int32), 0), 7
         )
 
         grp_offs = tl.arange(0, BLOCK_GRP)
@@ -78,34 +94,40 @@ def _store_quantized_value(
             mask=grp_mask,
         )
 
-        sc_offset = val_cache_offset + VAL_DATA_BYTES
-        sc_f16 = v_scale.to(tl.float16)
-        sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
-        tl.store(KV_cache_ptr + slot_base + sc_offset, (sc_u16 & 0xFF).to(tl.uint8))
-        tl.store(
-            KV_cache_ptr + slot_base + sc_offset + 1,
-            ((sc_u16 >> 8) & 0xFF).to(tl.uint8),
-        )
-        zr_f16 = val_min.to(tl.float16)
-        zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
-        tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (zr_u16 & 0xFF).to(tl.uint8))
-        tl.store(
-            KV_cache_ptr + slot_base + sc_offset + 3,
-            ((zr_u16 >> 8) & 0xFF).to(tl.uint8),
-        )
+        # Store per-group scale/zero metadata (SM70: hi byte before lo byte)
+        meta_offs = tl.arange(0, N_GROUPS)
+        sc_f16_vec = g_scales.to(tl.float16)
+        sc_u16_vec = sc_f16_vec.to(tl.uint16, bitcast=True)
+        zr_f16_vec = g_mins.to(tl.float16)
+        zr_u16_vec = zr_f16_vec.to(tl.uint16, bitcast=True)
+        meta_base = slot_base + val_cache_offset + VAL_DATA_BYTES
+        tl.store(KV_cache_ptr + meta_base + meta_offs * 4 + 1, ((sc_u16_vec >> 8) & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + meta_base + meta_offs * 4, (sc_u16_vec & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + meta_base + meta_offs * 4 + 3, ((zr_u16_vec >> 8) & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + meta_base + meta_offs * 4 + 2, (zr_u16_vec & 0xFF).to(tl.uint8))
 
     else:  # VQB == 4
         val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(
             tl.float32
         )
-        val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
-        val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
-        v_scale = (val_max - val_min) / 15.0
-        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
 
-        # Quantize all D elements from register (no re-load)
+        # Group=32: vectorized min/max via reshape [N_GROUPS, 32]
+        N_GROUPS: tl.constexpr = D // 32
+        val_2d = tl.reshape(val_vec, [N_GROUPS, BLOCK_D // N_GROUPS])
+        g_mins = tl.min(val_2d, axis=1)  # [N_GROUPS]
+        g_maxs = tl.max(val_2d, axis=1)  # [N_GROUPS]
+        g_scales = (g_maxs - g_mins) / 15.0
+        g_scales = tl.where(g_scales > 1e-8, g_scales, 1e-8)
+
+        # Broadcast back to per-element via reshape [N_GROUPS, 32] -> [BLOCK_D]
+        g_scale_2d = g_scales[:, None] + tl.zeros([N_GROUPS, BLOCK_D // N_GROUPS], dtype=tl.float32)
+        g_min_2d = g_mins[:, None] + tl.zeros([N_GROUPS, BLOCK_D // N_GROUPS], dtype=tl.float32)
+        g_scale_flat = tl.reshape(g_scale_2d, [BLOCK_D])
+        g_min_flat = tl.reshape(g_min_2d, [BLOCK_D])
+
+        # Quantize all D elements using per-element (per-group) scale/zero
         q_all = tl.minimum(
-            tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 15
+            tl.maximum(((val_vec - g_min_flat) / g_scale_flat + 0.5).to(tl.int32), 0), 15
         )
         # Reshape to pairs and pack two 4-bit values per byte
         q_pairs = tl.reshape(q_all, [BLOCK_D // 2, 2])
@@ -119,21 +141,17 @@ def _store_quantized_value(
             mask=val_mask,
         )
 
-        sc_offset = val_cache_offset + VAL_DATA_BYTES
-        sc_f16 = v_scale.to(tl.float16)
-        sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
-        tl.store(KV_cache_ptr + slot_base + sc_offset, (sc_u16 & 0xFF).to(tl.uint8))
-        tl.store(
-            KV_cache_ptr + slot_base + sc_offset + 1,
-            ((sc_u16 >> 8) & 0xFF).to(tl.uint8),
-        )
-        zr_f16 = val_min.to(tl.float16)
-        zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
-        tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (zr_u16 & 0xFF).to(tl.uint8))
-        tl.store(
-            KV_cache_ptr + slot_base + sc_offset + 3,
-            ((zr_u16 >> 8) & 0xFF).to(tl.uint8),
-        )
+        # Store per-group scale/zero metadata (SM70: hi byte before lo byte)
+        meta_offs = tl.arange(0, N_GROUPS)
+        sc_f16_vec = g_scales.to(tl.float16)
+        sc_u16_vec = sc_f16_vec.to(tl.uint16, bitcast=True)
+        zr_f16_vec = g_mins.to(tl.float16)
+        zr_u16_vec = zr_f16_vec.to(tl.uint16, bitcast=True)
+        meta_base = slot_base + val_cache_offset + VAL_DATA_BYTES
+        tl.store(KV_cache_ptr + meta_base + meta_offs * 4 + 1, ((sc_u16_vec >> 8) & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + meta_base + meta_offs * 4, (sc_u16_vec & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + meta_base + meta_offs * 4 + 3, ((zr_u16_vec >> 8) & 0xFF).to(tl.uint8))
+        tl.store(KV_cache_ptr + meta_base + meta_offs * 4 + 2, (zr_u16_vec & 0xFF).to(tl.uint8))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -319,10 +337,11 @@ def _tq_fused_store_mse(
 
     vn_f16 = tl.load(Norms_ptr + pid).to(tl.float16)
     vn_u16 = vn_f16.to(tl.uint16, bitcast=True)
-    tl.store(KV_cache_ptr + slot_base + norm_offset, (vn_u16 & 0xFF).to(tl.uint8))
+    # SM70 workaround: store high byte first (see VQB==8 branch in _store_quantized_value).
     tl.store(
         KV_cache_ptr + slot_base + norm_offset + 1, ((vn_u16 >> 8) & 0xFF).to(tl.uint8)
     )
+    tl.store(KV_cache_ptr + slot_base + norm_offset, (vn_u16 & 0xFF).to(tl.uint8))
 
     # ── 4. VALUE QUANTIZE + PACK ──────────────────────────────────────
     _store_quantized_value(

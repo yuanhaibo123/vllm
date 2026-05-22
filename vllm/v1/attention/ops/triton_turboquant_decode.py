@@ -250,24 +250,28 @@ def _tq_decode_stage1(
             raw16 = val_raw0 | (val_raw1 << 8)
             v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
 
-            sc_bases = val_bases + VAL_DATA_BYTES
-            sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            sc_hi = tl.load(KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            v_scales = (
-                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            )
-            zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            values = v_idx * v_scales[:, None] + v_zeros[:, None]
+            # Group=32: per-element group offset for scale/zero loads [BLOCK_KV, BLOCK_D]
+            g_offs_3 = d_offs // 32
+            sc_meta_addrs_3 = val_bases[:, None] + VAL_DATA_BYTES + g_offs_3[None, :] * 4
+            sc_lo_3 = tl.load(
+                KV_cache_ptr + sc_meta_addrs_3,
+                mask=kv_mask[:, None] & d_mask[None, :], other=0,
+            ).to(tl.uint16)
+            sc_hi_3 = tl.load(
+                KV_cache_ptr + sc_meta_addrs_3 + 1,
+                mask=kv_mask[:, None] & d_mask[None, :], other=0,
+            ).to(tl.uint16)
+            v_scales = (sc_lo_3 | (sc_hi_3 << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            zr_lo_3 = tl.load(
+                KV_cache_ptr + sc_meta_addrs_3 + 2,
+                mask=kv_mask[:, None] & d_mask[None, :], other=0,
+            ).to(tl.uint16)
+            zr_hi_3 = tl.load(
+                KV_cache_ptr + sc_meta_addrs_3 + 3,
+                mask=kv_mask[:, None] & d_mask[None, :], other=0,
+            ).to(tl.uint16)
+            v_zeros = (zr_lo_3 | (zr_hi_3 << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            values = v_idx * v_scales + v_zeros
         else:  # VQB == 4
             vb_idx = d_offs // 2
             vb_shift = (d_offs % 2) * 4
@@ -279,24 +283,28 @@ def _tq_decode_stage1(
             ).to(tl.int32)
             v_idx = ((val_raw >> vb_shift[None, :]) & 0xF).to(tl.float32)
 
-            sc_bases = val_bases + VAL_DATA_BYTES
-            sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            sc_hi = tl.load(KV_cache_ptr + sc_bases + 1, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            v_scales = (
-                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            )
-            zr_lo = tl.load(KV_cache_ptr + sc_bases + 2, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            zr_hi = tl.load(KV_cache_ptr + sc_bases + 3, mask=kv_mask, other=0).to(
-                tl.uint16
-            )
-            v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            values = v_idx * v_scales[:, None] + v_zeros[:, None]
+            # Group=32: per-element group offset for scale/zero loads [BLOCK_KV, BLOCK_D]
+            g_offs_4 = d_offs // 32
+            sc_meta_addrs_4 = val_bases[:, None] + VAL_DATA_BYTES + g_offs_4[None, :] * 4
+            sc_lo_4 = tl.load(
+                KV_cache_ptr + sc_meta_addrs_4,
+                mask=kv_mask[:, None] & d_mask[None, :], other=0,
+            ).to(tl.uint16)
+            sc_hi_4 = tl.load(
+                KV_cache_ptr + sc_meta_addrs_4 + 1,
+                mask=kv_mask[:, None] & d_mask[None, :], other=0,
+            ).to(tl.uint16)
+            v_scales = (sc_lo_4 | (sc_hi_4 << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            zr_lo_4 = tl.load(
+                KV_cache_ptr + sc_meta_addrs_4 + 2,
+                mask=kv_mask[:, None] & d_mask[None, :], other=0,
+            ).to(tl.uint16)
+            zr_hi_4 = tl.load(
+                KV_cache_ptr + sc_meta_addrs_4 + 3,
+                mask=kv_mask[:, None] & d_mask[None, :], other=0,
+            ).to(tl.uint16)
+            v_zeros = (zr_lo_4 | (zr_hi_4 << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            values = v_idx * v_scales + v_zeros
 
         # ============================================================
         # WEIGHTED VALUE ACCUMULATION
@@ -418,12 +426,14 @@ def _tq_full_dequant_kv(
         )
         v_idx = ((val_raw >> vb_shift) & 0xF).to(tl.float32)
 
+        # Group=32: per-element group offset for scale/zero [BLOCK_D]
+        g_d = d_offs // 32
         sc_base = val_base + VAL_DATA_BYTES
-        sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
-        sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
+        sc_lo = tl.load(KV_cache_ptr + sc_base + g_d * 4, mask=d_mask, other=0).to(tl.uint16)
+        sc_hi = tl.load(KV_cache_ptr + sc_base + g_d * 4 + 1, mask=d_mask, other=0).to(tl.uint16)
         v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
-        zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
+        zr_lo = tl.load(KV_cache_ptr + sc_base + g_d * 4 + 2, mask=d_mask, other=0).to(tl.uint16)
+        zr_hi = tl.load(KV_cache_ptr + sc_base + g_d * 4 + 3, mask=d_mask, other=0).to(tl.uint16)
         v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
         v_vals = v_idx * v_scale + v_zero
     elif VQB == 3:
@@ -440,12 +450,14 @@ def _tq_full_dequant_kv(
         raw16_val = val_raw0 | (val_raw1 << 8)
         v_idx = ((raw16_val >> val_bit_shift) & 0x7).to(tl.float32)
 
+        # Group=32: per-element group offset for scale/zero [BLOCK_D]
+        g_d3 = d_offs // 32
         sc_base = val_base + VAL_DATA_BYTES
-        sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
-        sc_hi = tl.load(KV_cache_ptr + sc_base + 1).to(tl.uint16)
+        sc_lo = tl.load(KV_cache_ptr + sc_base + g_d3 * 4, mask=d_mask, other=0).to(tl.uint16)
+        sc_hi = tl.load(KV_cache_ptr + sc_base + g_d3 * 4 + 1, mask=d_mask, other=0).to(tl.uint16)
         v_scale = (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
-        zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
+        zr_lo = tl.load(KV_cache_ptr + sc_base + g_d3 * 4 + 2, mask=d_mask, other=0).to(tl.uint16)
+        zr_hi = tl.load(KV_cache_ptr + sc_base + g_d3 * 4 + 3, mask=d_mask, other=0).to(tl.uint16)
         v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
         v_vals = v_idx * v_scale + v_zero
     else:

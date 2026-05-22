@@ -144,10 +144,12 @@ class TurboQuantConfig:
     def value_packed_size(self) -> int:
         """Packed bytes for a single VALUE vector.
 
-        Uniform quantization: ceil(head_dim * bits / 8) + 4 bytes (scale + zero fp16).
+        Uniform quantization: ceil(head_dim * bits / 8) + 4 * n_groups bytes.
+        Group size is 32 elements: each group gets its own fp16 scale + fp16 zero.
         """
         data_bytes = math.ceil(self.head_dim * self.value_quant_bits / 8)
-        return data_bytes + 4  # +2 scale(fp16) +2 zero(fp16)
+        n_groups = self.head_dim // 32
+        return data_bytes + 4 * n_groups  # 4 bytes (scale fp16 + zero fp16) per group
 
     @property
     def slot_size(self) -> int:

@@ -1615,6 +1615,13 @@ class GPUModelRunner(
         Equivalent to but faster than:
         np.concatenate([np.arange(n) for n in num_tokens])
         """
+        n = len(num_tokens)
+        # Fast path for pure decode: every request contributes exactly 1 token.
+        # query_pos[:n] = 0, cu_num_tokens = [1, 2, ..., n].
+        if n > 0 and int(num_tokens.max()) == 1:
+            arange_out[:n] = 0
+            return self.arange_np[:n] + 1
+
         # Step 1. [2, 5, 3] -> [2, 7, 10]
         cu_num_tokens = np.cumsum(num_tokens, dtype=cumsum_dtype)
         total_num_tokens = cu_num_tokens[-1]
@@ -1641,8 +1648,10 @@ class GPUModelRunner(
             prev_positions.fill(-1)
             return
 
-        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
+        prev_positions[:] = [
+            prev_req_id_to_index.get(r, -1)
+            for r in self.input_batch.req_ids[:num_reqs]
+        ]
 
     def _prepare_input_ids(
         self,
@@ -1840,9 +1849,17 @@ class GPUModelRunner(
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
+        # Fast path for pure decode: every request contributes exactly 1 token,
+        # so req_indices == arange(num_reqs) with no repetition, and
+        # query_pos[:num_reqs] == 0 (set by _get_cumsum_and_arange fast path).
+        _pure_decode = total_num_scheduled_tokens == num_reqs
+
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+        if _pure_decode:
+            req_indices = self.arange_np[:num_reqs]
+        else:
+            req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
         # self.query_pos.np[:10]: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -1851,10 +1868,15 @@ class GPUModelRunner(
         )
 
         # Get positions.
-        positions_np = (
-            self.input_batch.num_computed_tokens_cpu[req_indices]
-            + self.query_pos.np[: cu_num_tokens[-1]]
-        )
+        if _pure_decode:
+            # query_pos[:num_reqs] == 0 (from _get_cumsum_and_arange fast path),
+            # so positions_np == num_computed_tokens_cpu[:num_reqs] directly.
+            positions_np = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        else:
+            positions_np = (
+                self.input_batch.num_computed_tokens_cpu[req_indices]
+                + self.query_pos.np[: cu_num_tokens[-1]]
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)

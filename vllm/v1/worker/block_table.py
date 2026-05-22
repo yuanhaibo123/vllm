@@ -98,6 +98,9 @@ class BlockTable:
             self.dcp_world_size = 1
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+        # True when the CPU block table has been modified since the last
+        # commit_block_table call.  Starts True so the first commit always runs.
+        self._dirty = True
 
     def append_row(
         self,
@@ -116,6 +119,7 @@ class BlockTable:
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+        self._dirty = True
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
@@ -126,17 +130,20 @@ class BlockTable:
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
         self.num_blocks_per_row[row_idx] = 0
+        self._dirty = True
 
     def move_row(self, src: int, tgt: int) -> None:
         num_blocks = self.num_blocks_per_row[src]
         block_table_np = self.block_table.np
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
         self.num_blocks_per_row[tgt] = num_blocks
+        self._dirty = True
 
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
+        self._dirty = True
 
     def compute_slot_mapping(
         self,
@@ -164,11 +171,14 @@ class BlockTable:
         )
 
     def commit_block_table(self, num_reqs: int) -> None:
-        self.block_table.copy_to_gpu(num_reqs)
+        if self._dirty:
+            self.block_table.copy_to_gpu(num_reqs)
+            self._dirty = False
 
     def clear(self) -> None:
         self.block_table.gpu.fill_(0)
         self.block_table.cpu.fill_(0)
+        self._dirty = True
 
     @staticmethod
     def map_to_kernel_blocks(
