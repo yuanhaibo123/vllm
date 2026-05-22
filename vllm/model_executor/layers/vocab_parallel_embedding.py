@@ -64,35 +64,6 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
             return
-        # INT8-compress large vocab embedding tables to save VRAM (~1.2 GB for
-        # a 248K-vocab model).  Only applies to pure embedding lookups
-        # (VocabParallelEmbedding), NOT ParallelLMHead which uses apply()/GEMV.
-        #
-        # Chunked to avoid OOM: FP32 intermediate is one small slice at a time
-        # (~80 MB peak extra) instead of a full FP32 copy of the whole matrix.
-        if (
-            current_platform.is_cuda_alike()
-            and type(layer).__name__ == "VocabParallelEmbedding"
-            and hasattr(layer, "weight")
-            and layer.weight.dtype in (torch.float16, torch.bfloat16)
-        ):
-            orig_dtype = layer.weight.dtype
-            device = layer.weight.device
-            n_rows, emb_dim = layer.weight.shape
-            # Pre-allocate outputs (INT8 + scale) before touching the original.
-            w_int8 = torch.empty(n_rows, emb_dim, dtype=torch.int8, device=device)
-            w_scale = torch.empty(n_rows, dtype=torch.float16, device=device)
-            CHUNK = 4096
-            for start in range(0, n_rows, CHUNK):
-                end = min(start + CHUNK, n_rows)
-                chunk = layer.weight.data[start:end].float()
-                s = chunk.abs().max(dim=1).values.clamp_(min=1e-5).div_(127.0)
-                w_int8[start:end] = chunk.div_(s.unsqueeze(1)).round_().clamp_(-128, 127).to(torch.int8)
-                w_scale[start:end] = s.half()
-            layer._parameters.pop("weight", None)
-            layer.register_buffer("weight", w_int8)
-            layer.register_buffer("weight_scale", w_scale)
-            layer._embed_orig_dtype = orig_dtype
 
     def apply(
         self,
@@ -105,12 +76,6 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        if layer.weight.dtype == torch.int8:
-            # Per-row dequantize: gather only the requested rows (efficient at M=1)
-            rows = layer.weight[input_].float()
-            scales = layer.weight_scale[input_].float()
-            orig_dtype = getattr(layer, "_embed_orig_dtype", torch.float16)
-            return (rows * scales.unsqueeze(-1)).to(orig_dtype)
         return F.embedding(input_, layer.weight)
 
 
