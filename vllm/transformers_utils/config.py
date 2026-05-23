@@ -758,6 +758,32 @@ def get_config(
             # Note that, this parameter is always false (HF default) on Qwen2 MoE.
             apply_gguf_default("norm_topk_prob", True)
 
+        if config.model_type in {"qwen3_5_text", "qwen3_5"} and "gguf_file" in kwargs:
+            # The qwen35 GGML map does not include ssm.time_step_rank or
+            # ssm.group_count, so linear_num_value_heads and linear_num_key_heads
+            # stay at class defaults (32 and 16). Read them from GGUF metadata.
+            import gguf as _gguf_mod
+            _gguf_path = Path(model) / kwargs["gguf_file"]
+            _reader = _gguf_mod.GGUFReader(str(_gguf_path), "r")
+            _nv_field = _reader.fields.get("qwen35.ssm.time_step_rank")
+            _nk_field = _reader.fields.get("qwen35.ssm.group_count")
+            if _nv_field is not None:
+                apply_gguf_default("linear_num_value_heads", int(_nv_field.parts[-1][0]))
+            if _nk_field is not None:
+                apply_gguf_default("linear_num_key_heads", int(_nk_field.parts[-1][0]))
+            # MTP (nextn_predict) layers are appended at the end of the GGUF
+            # block list but should NOT participate in the main inference
+            # forward path (they are only used for speculative decoding).
+            # Reduce num_hidden_layers so vllm only instantiates and runs
+            # the standard transformer layers (no MTP blocks).
+            _nextn_field = _reader.fields.get("qwen35.nextn_predict_layers")
+            if _nextn_field is not None:
+                _num_nextn = int(_nextn_field.parts[-1][0])
+                if _num_nextn > 0:
+                    config.num_hidden_layers -= _num_nextn
+                    if hasattr(config, "layer_types") and config.layer_types:
+                        config.layer_types = config.layer_types[: config.num_hidden_layers]
+
     # Special architecture mapping check for GGUF models
     if _is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:

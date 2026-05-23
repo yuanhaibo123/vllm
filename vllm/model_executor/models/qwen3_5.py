@@ -195,6 +195,36 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
 
 
+def _gguf_v_deinterleave(
+    tensor: torch.Tensor,
+    dim: int,
+    nv: int,
+    nk: int,
+) -> torch.Tensor:
+    """Convert GGUF GQA-group-first V-head order to HF sequential order.
+
+    GGUF packs V-heads as [group0_all_k_heads, group1_all_k_heads, ...]
+    where group g contains nk heads.  HF expects heads ordered [v0, v1, ...]
+    with adjacent heads belonging to consecutive groups.
+
+    Works on both floating-point tensors (F32) and raw quantized byte tensors
+    (uint8) because each V-head occupies a contiguous stride along `dim`.
+    """
+    ratio = nv // nk
+    if ratio == 1:
+        return tensor
+    total = tensor.shape[dim]
+    assert total % nv == 0, (
+        f"_gguf_v_deinterleave: dim {dim} has size {total}, "
+        f"not divisible by nv={nv}"
+    )
+    stride = total // nv  # bytes or values per V-head along this dim
+    shape = list(tensor.shape)
+    t = tensor.reshape(shape[:dim] + [ratio, nk, stride] + shape[dim + 1:])
+    t = t.transpose(dim, dim + 1).contiguous()
+    return t.reshape(shape)
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -303,6 +333,20 @@ class Qwen3_5Model(Qwen3NextModel):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+
+        # Precompute GGUF V-head de-interleave parameters.
+        # GGUF stores GDN V-head-indexed tensors in group-first order
+        # (nk heads per group × ratio groups) rather than HF sequential order.
+        # We de-interleave at weight-load time for all affected tensors.
+        if self._is_gguf and hasattr(self.config, 'linear_num_value_heads'):
+            _nv = self.config.linear_num_value_heads   # e.g. 32 (4B) / 48 (27B)
+            _nk = self.config.linear_num_key_heads     # 16
+            _v_hd = self.config.linear_value_head_dim  # 128
+            _do_deint = False
+        else:
+            _nv = _nk = _v_hd = 0
+            _do_deint = False
+
         expert_params_mapping = self.get_expert_mapping()
         is_fused_expert = False
         base_layer = (
@@ -339,6 +383,7 @@ class Qwen3_5Model(Qwen3NextModel):
                 if "mlp.experts" in name:
                     continue
 
+                orig_name = name  # save before replacement
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -351,12 +396,24 @@ class Qwen3_5Model(Qwen3NextModel):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                # GGUF V-head de-interleave for GDN stacked projections.
+                if _do_deint and "linear_attn" in name and "qweight_type" not in name:
+                    if weight_name == "in_proj_qkv":
+                        # attn_qkv = [Q | K | V]; only V portion is interleaved.
+                        v_start = 2 * _nk * _v_hd
+                        v_rows = _gguf_v_deinterleave(
+                            loaded_weight[v_start:].clone(), 0, _nv, _nk
+                        )
+                        loaded_weight = torch.cat(
+                            [loaded_weight[:v_start], v_rows], dim=0
+                        )
+                    elif weight_name in ("in_proj_z", "in_proj_b", "in_proj_a"):
+                        # Z gate (shape [nv*hd, in]) and B/A projections
+                        # (shape [nv, in]): entire dim-0 is V-head indexed.
+                        loaded_weight = _gguf_v_deinterleave(
+                            loaded_weight, 0, _nv, _nk
+                        )
                 weight_loader(param, loaded_weight, shard_id)
-                # Stacked path diagnostic
-                if self._is_gguf and "layers.3." in name:
-                    _lw = loaded_weight.float() if loaded_weight.is_floating_point() else loaded_weight.float()
-                    logger.info("[WLD-S] layers.3 stacked: %s[%s]  shape=%s  dtype=%s",
-                                name, shard_id, list(loaded_weight.shape), loaded_weight.dtype)
                 break
             else:
                 is_expert_weight = False
@@ -441,6 +498,30 @@ class Qwen3_5Model(Qwen3NextModel):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    # GGUF V-head de-interleave for GDN non-stacked tensors.
+                    if _do_deint and "linear_attn" in name and "qweight_type" not in name:
+                        if "linear_attn.A_log" in name or "linear_attn.dt_bias" in name:
+                            # 1-D tensors [nv]: de-interleave in place.
+                            loaded_weight = _gguf_v_deinterleave(
+                                loaded_weight, 0, _nv, _nk
+                            )
+                        elif "linear_attn.conv1d" in name:
+                            # conv1d.weight [conv_dim, kernel_size]:
+                            # V channels are the last nv*v_hd rows.
+                            v_start = 2 * _nk * _v_hd
+                            v_rows = _gguf_v_deinterleave(
+                                loaded_weight[v_start:].clone(), 0, _nv, _nk
+                            )
+                            loaded_weight = torch.cat(
+                                [loaded_weight[:v_start], v_rows], dim=0
+                            )
+                        elif "linear_attn.out_proj" in name:
+                            # out_proj.qweight [hidden, nv*bytes_per_head]:
+                            # V-head indexed on dim=1.
+                            loaded_weight = _gguf_v_deinterleave(
+                                loaded_weight, 1, _nv, _nk
+                            )
+
                     # GGUF stores ssm_a as raw A (negative floats).
                     # The HF parameter A_log = log(-A); apply the transform.
                     if "linear_attn.A_log" in name and loaded_weight.is_floating_point() and (loaded_weight < 0).all():
@@ -513,6 +594,7 @@ class Qwen3_5ForCausalLMBase(
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
+                    quant_config=vllm_config.quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )
         else:

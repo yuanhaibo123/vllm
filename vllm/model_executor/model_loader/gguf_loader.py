@@ -208,18 +208,32 @@ class GGUFModelLoader(BaseModelLoader):
             "qwen3_5_moe_text": "qwen35moe",
         }
 
-        # Qwen3.5/3.6 GGUF is not supported: the GGUF format stores
-        # V-head-indexed tensors in GQA-grouped order when num_v_heads !=
-        # num_k_heads (e.g. 4B: nk=16 nv=32, 27B: nk=16 nv=48). This
-        # produces incorrect output.  Use the HuggingFace checkpoint instead.
+        # Qwen3.5/3.6 GGUF: the gguf-py TensorNameMap for qwen35 uses
+        # "dt_proj" for the bias parameter, but the vllm qwen3_5 model
+        # names it "dt_bias".  Add manual GGUF → HF mappings for all
+        # GDN (linear-attention) layers so the loader can resolve them.
+        # MTP sub-layers are shipped in the same GGUF file but skipped
+        # during weight loading; mark them as sideload so they don't
+        # trigger the "unmapped parameters" error.
         if model_type in ("qwen3_5_text", "qwen3_5"):
-            raise ValueError(
-                "Loading Qwen3.5/Qwen3.6 from a GGUF file is not supported. "
-                "The GGUF format stores V-head tensors in GQA-grouped order "
-                "when num_v_heads != num_k_heads, which causes incorrect "
-                "inference output. Please use the HuggingFace format model "
-                "instead (e.g. Qwen/Qwen3.5-4B or Qwen/Qwen3.6-27B)."
+            full_attn_interval = getattr(
+                text_config, "full_attention_interval", 4
             )
+            for idx in range(text_config.num_hidden_layers):
+                if (idx + 1) % full_attn_interval != 0:  # GDN layer
+                    gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
+                        f"model.layers.{idx}.linear_attn.dt_bias"
+                    )
+                    # ssm_a has no .weight/.bias suffix, so the automatic
+                    # gguf_name + "." + suffix code would produce a trailing dot
+                    # ("blk.N.ssm_a.") that doesn't match the actual tensor name.
+                    # Add an explicit manual mapping here as a fallback.
+                    gguf_to_hf_name_map[f"blk.{idx}.ssm_a"] = (
+                        f"model.layers.{idx}.linear_attn.A_log"
+                    )
+            # MTP layer parameters are skipped in load_weights; exclude
+            # them from the unmapped-params check via sideload_params.
+            sideload_params.append(re.compile(r"model\.mtp\..*"))
 
         model_type = _HF_TO_GGUF_MODEL_TYPE.get(model_type, model_type)
 
@@ -338,7 +352,7 @@ class GGUFModelLoader(BaseModelLoader):
             if gguf_name is None:
                 return None
 
-            return gguf_name + "." + suffix
+            return gguf_name + ("." + suffix if suffix else "")
 
         # Build mapping and track unmapped parameters
         unmapped_params = []

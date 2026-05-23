@@ -7,8 +7,8 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
-# Debug flag: set to True from outside to print GDN forward diagnostics once
 _GDN_DBG_ENABLED: bool = False
+_GDN_DBG_FIRED = False
 
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
@@ -732,7 +732,24 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         if _GDN_DBG_ENABLED and self.layer_idx == 0:
-            pass
+            global _GDN_DBG_FIRED
+            if not _GDN_DBG_FIRED:
+                _GDN_DBG_FIRED = True
+                logger.warning(
+                    "[GDN-OUT] L0 core_attn_out: shape=%s norm=%.4f min=%.4f max=%.4f nan=%s",
+                    list(core_attn_out.shape),
+                    core_attn_out.float().norm().item(),
+                    core_attn_out.float().min().item(),
+                    core_attn_out.float().max().item(),
+                    core_attn_out.isnan().any().item(),
+                )
+                logger.warning(
+                    "[GDN-OUT] L0 z_gate: norm=%.4f min=%.4f max=%.4f silu_norm=%.4f",
+                    z.float().norm().item(),
+                    z.float().min().item(),
+                    z.float().max().item(),
+                    torch.nn.functional.silu(z.float()).norm().item(),
+                )
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
@@ -822,6 +839,33 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             a = a.contiguous()
 
         # GDN forward debug (fires when _GDN_DBG_ENABLED is True)
+        if _GDN_DBG_ENABLED and self.layer_idx == 0:
+            global _GDN_DBG_FIRED
+            if not _GDN_DBG_FIRED:
+                logger.warning(
+                    "[GDN-FWD] L0 A_log: min=%.4f max=%.4f first4=%s",
+                    self.A_log.float().min().item(), self.A_log.float().max().item(),
+                    self.A_log.float().tolist()[:4],
+                )
+                logger.warning(
+                    "[GDN-FWD] L0 dt_bias: min=%.4f max=%.4f first4=%s",
+                    self.dt_bias.float().min().item(), self.dt_bias.float().max().item(),
+                    self.dt_bias.float().tolist()[:4],
+                )
+                logger.warning(
+                    "[GDN-FWD] L0 b(beta): norm=%.4f mean=%.4f min=%.4f max=%.4f",
+                    b.float().norm().item(), b.float().mean().item(),
+                    b.float().min().item(), b.float().max().item(),
+                )
+                logger.warning(
+                    "[GDN-FWD] L0 a(alpha): norm=%.4f mean=%.4f min=%.4f max=%.4f",
+                    a.float().norm().item(), a.float().mean().item(),
+                    a.float().min().item(), a.float().max().item(),
+                )
+                logger.warning(
+                    "[GDN-FWD] L0 mixed_qkv: norm=%.4f z_gate_rms=%.4f",
+                    mixed_qkv.float().norm().item(), z.float().norm().item(),
+                )
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
