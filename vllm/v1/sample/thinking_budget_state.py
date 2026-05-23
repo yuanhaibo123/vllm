@@ -63,6 +63,11 @@ class ThinkingBudgetStateHolder:
         self.device = device
         self._state: dict[int, dict[str, Any]] = {}
         self.cu_num_tokens: dict[int, int] = {}
+        # True when at least one sequence has a non-zero pre-computed nudge bonus.
+        # Maintained by _update_think_state; guards the nudge block in
+        # _apply_forcing_to_logits so the overhead is a single bool check
+        # for the 80%+ of steps where no sequence is near its budget.
+        self._nudge_active: bool = False
 
         if self.num_spec_tokens > 0:
             self.mask = torch.zeros(
@@ -241,6 +246,7 @@ class ThinkingBudgetStateHolder:
             "in_spec_mode": False,
             "bonus_token_forced": False,
             "continue_thinking": continue_thinking,
+            "nudge_bonus": 0.0,
         }
 
     def _update_think_state(self, state: dict[str, Any]) -> None:
@@ -250,6 +256,7 @@ class ThinkingBudgetStateHolder:
             state["thinking_token_budget"] = -1
             state["in_end"] = False
             state["force_index"] = []
+            state["nudge_bonus"] = 0.0
             return
 
         if state["start_thinking"] == -1:
@@ -448,6 +455,32 @@ class ThinkingBudgetStateHolder:
                     }
                 )
 
+        # Pre-compute nudge bonus (used by _apply_forcing_to_logits).
+        # Done here (CPU path) so the GPU-hot apply path is a single flag check.
+        budget = state.get("thinking_token_budget", 0)
+        think_count = state.get("think_count", 0)
+        if (
+            state.get("in_think", False)
+            and not state.get("in_end", False)
+            and budget > 0
+        ):
+            remaining_frac = max(0.0, (budget - think_count) / budget)
+            if remaining_frac <= 0.20:
+                if remaining_frac > 0.10:
+                    bonus = 3.0 * (0.20 - remaining_frac) / 0.10
+                else:
+                    bonus = 3.0 + 5.0 * (0.10 - remaining_frac) / 0.10
+                state["nudge_bonus"] = bonus
+            else:
+                state["nudge_bonus"] = 0.0
+        else:
+            state["nudge_bonus"] = 0.0
+        # Update class-level flag so _apply_forcing_to_logits can skip the
+        # nudge block entirely when no sequence is in the nudge zone.
+        self._nudge_active = any(
+            s.get("nudge_bonus", 0.0) > 0.0 for s in self._state.values()
+        )
+
     def _apply_forcing_to_logits(
         self,
         logits: torch.Tensor,
@@ -525,35 +558,27 @@ class ThinkingBudgetStateHolder:
                 force_tokens = self.force_token_ids[active_indices]
                 logits[active_indices, force_tokens] = 1e9
 
-        # Soft logit nudge: gradually boost </think> token as budget runs low.
-        # This lets the model conclude naturally before the hard force triggers.
-        # Nudge schedule (fraction of budget remaining → logit bonus):
-        #   >20% remaining  → +0 (no nudge)
-        #   20% → 10%        → linearly +0 to +3
-        #   <10% remaining  → +3 to +8 (steeper ramp)
-        if self.think_end_token_ids:
+        # Soft logit nudge: boost </think> token as budget runs low.
+        # The pre-computed nudge_bonus in each state entry is set by
+        # _update_think_state (CPU path), so this block costs one bool check
+        # in the common case where no sequence is near its budget.
+        if self._nudge_active and self.think_end_token_ids:
             end_tok = self.think_end_token_ids[0]
+            nudge_rows: list[int] = []
+            nudge_vals: list[float] = []
             for seq_idx, state in self._state.items():
-                if state.get("in_end", False):
-                    continue  # already forcing, skip nudge
-                if not state.get("in_think", False):
-                    continue
-                budget = state.get("thinking_token_budget", 0)
-                think_count = state.get("think_count", 0)
-                if budget <= 0:
-                    continue
-                remaining_frac = max(0.0, (budget - think_count) / budget)
-                if remaining_frac > 0.20:
-                    continue
-                # Linear ramp: 0.20→0.10 = +0 to +3; 0.10→0.0 = +3 to +8
-                if remaining_frac > 0.10:
-                    bonus = 3.0 * (0.20 - remaining_frac) / 0.10
-                else:
-                    bonus = 3.0 + 5.0 * (0.10 - remaining_frac) / 0.10
-                if seq_idx not in self.cu_num_tokens:
-                    continue
-                row = self.cu_num_tokens[seq_idx]
-                if row < logits.shape[0]:
-                    logits[row, end_tok] += bonus
+                bonus = state.get("nudge_bonus", 0.0)
+                if bonus > 0.0 and seq_idx in self.cu_num_tokens:
+                    row = self.cu_num_tokens[seq_idx]
+                    if row < logits.shape[0]:
+                        nudge_rows.append(row)
+                        nudge_vals.append(bonus)
+            if nudge_rows:
+                # Single vectorized op — avoids per-element CUDA kernel launches
+                rows_t = torch.tensor(nudge_rows, dtype=torch.long,
+                                      device=logits.device)
+                vals_t = torch.tensor(nudge_vals, dtype=logits.dtype,
+                                      device=logits.device)
+                logits[rows_t, end_tok] += vals_t
 
         return logits
