@@ -7,7 +7,7 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 
-_GDN_DBG_ENABLED: bool = False
+_GDN_DBG_ENABLED: bool = True
 _GDN_DBG_FIRED = False
 
 from vllm import envs

@@ -40,6 +40,56 @@ from .gguf_utils import (
     is_remote_gguf,
     split_remote_gguf,
 )
+
+# Patch transformers' GGUF loader to support qwen35 (Qwen3.5/3.6 hybrid
+# SSM+Attention architecture).  Official transformers 5.8.1 does not include
+# qwen35 in GGUF_SUPPORTED_ARCHITECTURES or GGUF_CONFIG_MAPPING, so loading
+# any qwen35 GGUF crashes with "architecture qwen35 is not supported yet."
+# We register the architecture and its field mappings here so that the crash
+# is avoided and HF config fields are populated correctly from GGUF metadata.
+try:
+    import transformers.modeling_gguf_pytorch_utils as _gguf_utils
+    import transformers.integrations.ggml as _ggml
+
+    _QWEN35_CONFIG_MAP = {
+        "context_length": "max_position_embeddings",
+        "block_count": "num_hidden_layers",
+        "feed_forward_length": "intermediate_size",
+        "embedding_length": "hidden_size",
+        "rope.dimension_count": None,
+        "rope.freq_base": "rope_theta",
+        "attention.head_count": "num_attention_heads",
+        "attention.head_count_kv": "num_key_value_heads",
+        "attention.key_length": "head_dim",
+        "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+        "vocab_size": "vocab_size",
+        "ssm.conv_kernel": "linear_conv_kernel_dim",
+        "ssm.state_size": "linear_value_head_dim",
+        "ssm.time_step_rank": "linear_num_value_heads",
+        "ssm.group_count": "linear_num_key_heads",
+        "full_attention_interval": "full_attention_interval",
+    }
+
+    for _arch in ("qwen35", "qwen3_5_text"):
+        if _arch not in _gguf_utils.GGUF_SUPPORTED_ARCHITECTURES:
+            _gguf_utils.GGUF_SUPPORTED_ARCHITECTURES.append(_arch)
+        _ggml.GGUF_CONFIG_MAPPING.setdefault(_arch, _QWEN35_CONFIG_MAP)
+
+    # Remap raw GGUF architecture name "qwen35" -> "qwen3_5_text" in
+    # load_gguf_checkpoint so AutoConfig.from_pretrained finds the right class.
+    _orig_load = _gguf_utils.load_gguf_checkpoint
+    def _patched_load(gguf_checkpoint_path, return_tensors=False, **kw):
+        result = _orig_load(gguf_checkpoint_path, return_tensors=return_tensors, **kw)
+        if isinstance(result, dict) and result.get("config", {}).get("model_type") == "qwen35":
+            result["config"]["model_type"] = "qwen3_5_text"
+        return result
+    _gguf_utils.load_gguf_checkpoint = _patched_load
+    import transformers.configuration_utils as _cfg_utils
+    _cfg_utils.load_gguf_checkpoint = _patched_load
+
+    del _arch, _QWEN35_CONFIG_MAP
+except Exception:
+    pass  # If patching fails, apply_gguf_default below still covers the SSM fields
 from .repo_utils import (
     file_or_path_exists,
     get_hf_file_to_dict,
@@ -129,6 +179,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     qwen3_asr="Qwen3ASRConfig",
     qwen3_next="Qwen3NextConfig",
     qwen3_5="Qwen3_5Config",
+    qwen3_5_text="Qwen3_5TextConfig",  # HF model_type for text-only Qwen3.5 (GGUF path)
+    qwen35="Qwen3_5TextConfig",       # raw GGUF general.architecture name
     qwen3_5_moe="Qwen3_5MoeConfig",
     laguna="LagunaConfig",
     lfm2_moe="Lfm2MoeConfig",
@@ -189,6 +241,14 @@ class HFConfigParser(ConfigParserBase):
         )
         # Use custom model class if it's in our registry
         model_type = config_dict.get("model_type")
+        # Remap raw GGUF general.architecture strings that differ from the
+        # canonical HF model_type. Without this, the class attribute
+        # model_type gets overwritten to the raw GGUF name and downstream
+        # lookups in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES fail.
+        _GGUF_ARCH_REMAP = {"qwen35": "qwen3_5_text"}
+        if model_type in _GGUF_ARCH_REMAP:
+            model_type = _GGUF_ARCH_REMAP[model_type]
+            config_dict["model_type"] = model_type
         if model_type is None:
             model_type = (
                 "speculators"
@@ -758,7 +818,7 @@ def get_config(
             # Note that, this parameter is always false (HF default) on Qwen2 MoE.
             apply_gguf_default("norm_topk_prob", True)
 
-        if config.model_type in {"qwen3_5_text", "qwen3_5"} and "gguf_file" in kwargs:
+        if config.model_type in {"qwen3_5_text", "qwen3_5", "qwen35"} and "gguf_file" in kwargs:
             # The qwen35 GGML map does not include ssm.time_step_rank or
             # ssm.group_count, so linear_num_value_heads and linear_num_key_heads
             # stay at class defaults (32 and 16). Read them from GGUF metadata.
