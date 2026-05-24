@@ -209,6 +209,21 @@ def _fused_mul_mat_gguf(
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
+    # Q8_0 special path: MMVQ/MMQ both re-quantize fp16 activations to Q8_1
+    # (double quantization), which hurts accuracy more than other types because
+    # Q8_0 weights are already high precision. On SM 7.0 (Volta) there are no
+    # int8 Tensor Cores so the bandwidth saving is also smaller.
+    # Use MMVQ only for tiny decode batches (≤5 tokens); fall through to
+    # dequant + fp16 Tensor Core matmul for prefill, which is also 5-50x faster.
+    if qweight_type == int(WeightType.Q8_0):
+        if x.shape[0] <= 5:
+            y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
+        else:
+            block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+            shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
+            weight = ops.ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
+            y = x @ weight.T
+        return y
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
