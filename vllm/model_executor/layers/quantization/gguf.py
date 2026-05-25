@@ -193,6 +193,10 @@ IMATRIX_QUANT_TYPES = {
 DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+# MMQ (ggml_mul_mat_a8) uses tiled int8 arithmetic; only beneficial on SM7.5+
+# (Turing) where int8 Tensor Cores exist. On SM7.0 (Volta/Titan V) dequant +
+# fp16 Tensor Core GEMM is faster for batch > mmvq_safe.
+_MMQ_ENABLED = current_platform.has_device_capability(75)
 
 
 def _fused_mul_mat_gguf(
@@ -227,8 +231,8 @@ def _fused_mul_mat_gguf(
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    # Use MMQ Kernel if it's available (standard + k-quants)
-    elif qweight_type in MMQ_QUANT_TYPES:
+    # Use MMQ Kernel if it's available (standard + k-quants) and device supports it
+    elif _MMQ_ENABLED and qweight_type in MMQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     # If there is no available MMQ kernel, fallback to dequantize
     elif qweight_type in DEQUANT_TYPES:
