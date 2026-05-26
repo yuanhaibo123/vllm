@@ -137,14 +137,6 @@ def get_pp_indices(
     start_layer = sum(partitions[:pp_rank])
     end_layer = start_layer + partitions[pp_rank]
 
-    logger.info(
-        "[PP rank %d/%d] Layer assignment: %d-%d (%d layers) "
-        "[partition=%s, total=%d]",
-        pp_rank, pp_size,
-        start_layer, end_layer, end_layer - start_layer,
-        ",".join(str(p) for p in partitions), num_hidden_layers,
-    )
-
     return (start_layer, end_layer)
 
 

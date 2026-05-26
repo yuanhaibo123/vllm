@@ -2029,14 +2029,9 @@ def get_kv_cache_configs(
         )
 
     # Check if the available memory is enough per worker.
-    for worker_idx, (groups, avail_mem) in enumerate(
-            zip(projected_groups_per_worker, available_memory)):
+    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
             continue
-        logger.info(
-            "KV cache memory check: worker %d available=%.3f GiB",
-            worker_idx, avail_mem / 1024**3,
-        )
         _check_enough_kv_cache_memory(
             avail_mem,
             partial(_max_memory_usage_bytes_from_groups, vllm_config, groups),
