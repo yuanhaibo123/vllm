@@ -93,7 +93,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # calculate offset
     h += ((boh * H + i_h) * V * K).to(tl.int64)
     v += ((bos * H + i_h) * V).to(tl.int64)
-    k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
+    k += ((bos * Hg + i_h % Hg) * K).to(tl.int64)
     w += ((bos * H + i_h) * K).to(tl.int64)
     if SAVE_NEW_VALUE:
         v_new += ((bos * H + i_h) * V).to(tl.int64)
