@@ -61,7 +61,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
+    i_h = i_hv % H
     if IS_VARLEN:
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int64),
@@ -281,7 +281,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
+    i_h = i_hv % H
 
     o_k = tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
