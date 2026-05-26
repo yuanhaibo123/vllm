@@ -1312,20 +1312,11 @@ def gguf_quant_weights_iterator(
     """
 
     reader = gguf.GGUFReader(gguf_file)
-    _iter_logged = [False]
 
     for tensor in reader.tensors:
         if tensor.name in gguf_to_hf_name_map:
             weight_type = tensor.tensor_type
             name = gguf_to_hf_name_map[tensor.name]
-            if not _iter_logged[0] and "attn_qkv" in tensor.name:
-                import logging as _logging
-                _logging.getLogger("vllm").warning(
-                    "[GGUF-ITER] tensor.name=%s -> map value=%s -> renamed=%s",
-                    tensor.name, name, name.replace("weight", "qweight_type") if weight_type.name not in ("F32","BF16","F16") else name
-                )
-                _iter_logged[0] = True
-
             if weight_type.name not in ("F32", "BF16", "F16"):
                 weight_type_name = name.replace("weight", "qweight_type")
                 weight_type = torch.tensor(weight_type)
