@@ -252,7 +252,6 @@ class Qwen3_5Model(Qwen3NextModel):
         self.vocab_size = config.vocab_size
         quant_config = vllm_config.quant_config
         self._is_gguf = type(quant_config).__name__ == "GGUFConfig"
-        logger.info("Qwen3_5Model: quant_config=%s, _is_gguf=%s", type(quant_config).__name__, self._is_gguf)
 
         # Only allocate embed_tokens on the first PP rank — it is never used
         # on middle/last ranks (forward receives hidden_states from prev rank),
@@ -525,9 +524,6 @@ class Qwen3_5Model(Qwen3NextModel):
                     # GGUF stores ssm_a as raw A (negative floats).
                     # The HF parameter A_log = log(-A); apply the transform.
                     if "linear_attn.A_log" in name and loaded_weight.is_floating_point() and (loaded_weight < 0).all():
-                        logger.info("A_log transform: pre=%.4f..%.4f → post=%.4f..%.4f",
-                                    loaded_weight.min().item(), loaded_weight.max().item(),
-                                    torch.log(-loaded_weight).min().item(), torch.log(-loaded_weight).max().item())
                         loaded_weight = torch.log(-loaded_weight)
                     # GemmaRMSNorm does: out = rms_norm(x) * (weight + 1)
                     # GGUF stores the full multiplier (centered ~1.0).
