@@ -517,22 +517,7 @@ class GGUFLinearMethod(LinearMethodBase):
         qweight = layer.qweight
         shard_id_map = qweight.shard_id_map
         shard_id = qweight.shard_id
-        dc_len = len(qweight.data_container)
-        if dc_len <= 1 and len(shard_id) > 0:
-            import logging as _logging
-            _logging.getLogger("vllm").warning(
-                "[GGUF-DBG] _create_padded_weight_param: layer=%s "
-                "data_container len=%d shard_id=%r shard_id_map=%r — "
-                "padded param NOT created (GGUFUninitializedParameter will remain).",
-                getattr(layer, "name", repr(layer)[:80]),
-                dc_len, shard_id, shard_id_map,
-            )
         if len(data_container := qweight.data_container) > 1:
-            import logging as _logging
-            _logging.getLogger("vllm").warning(
-                "[GGUF-PAD] _create_padded_weight_param: layer=%s dc_len=%d — creating padded",
-                getattr(layer, "name", repr(layer)[:80]), len(data_container),
-            )
             dtype = {data.dtype for data in data_container}
             assert len(dtype) == 1, ValueError(
                 f"Data container has mixed dtypes: {dtype}"
