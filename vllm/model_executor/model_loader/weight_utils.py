@@ -1277,6 +1277,28 @@ def get_gguf_weight_type_map(
     }
 
 
+def get_gguf_extra_names_and_weight_type_map(
+    gguf_file: str | Path, gguf_to_hf_name_map: dict[str, str]
+) -> tuple[list[str], dict[str, str]]:
+    """
+    Combined single-pass helper: returns both the extra-tensor names and the
+    weight-type map in one GGUFReader scan, avoiding two separate file parses.
+    """
+    reader = gguf.GGUFReader(gguf_file)
+    expected_gguf_keys = set(gguf_to_hf_name_map.keys())
+    exact_gguf_keys: set[str] = set()
+    weight_type_map: dict[str, str] = {}
+    for tensor in reader.tensors:
+        exact_gguf_keys.add(tensor.name)
+        if tensor.name in gguf_to_hf_name_map:
+            weight_type_map[gguf_to_hf_name_map[tensor.name]] = (
+                tensor.tensor_type.name
+            )
+    extra_keys = expected_gguf_keys - exact_gguf_keys
+    extra_names = [gguf_to_hf_name_map[key] for key in extra_keys]
+    return extra_names, weight_type_map
+
+
 def gguf_quant_weights_iterator(
     gguf_file: str | Path, gguf_to_hf_name_map: dict[str, str]
 ) -> Generator[tuple[str, torch.Tensor], None, None]:

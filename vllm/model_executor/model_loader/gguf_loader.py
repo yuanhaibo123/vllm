@@ -21,6 +21,7 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.model_executor.model_loader.weight_utils import (
     download_gguf,
+    get_gguf_extra_names_and_weight_type_map,
     get_gguf_extra_tensor_names,
     get_gguf_weight_type_map,
     gguf_quant_weights_iterator,
@@ -471,17 +472,32 @@ class GGUFModelLoader(BaseModelLoader):
         device_config = vllm_config.device_config
         local_model_path = self._prepare_weights(model_config)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
-        # we can only know if tie word embeddings after mapping weights
+        # Single pass per file: gather extra tensor names + weight type map
+        # together, avoiding two separate GGUFReader scans of the same file.
         gguf_files = self._get_all_gguf_files(local_model_path)
-        all_extra_names = []
+        all_extra_names: list[str] = []
+        weight_type_map: dict[str, str] = {}
         for f in gguf_files:
-            all_extra_names.extend(get_gguf_extra_tensor_names(f, gguf_weights_map))
+            extra_names, wt_map = get_gguf_extra_names_and_weight_type_map(
+                f, gguf_weights_map
+            )
+            all_extra_names.extend(extra_names)
+            weight_type_map.update(wt_map)
         if "lm_head.weight" in all_extra_names:
             model_config.hf_config.update({"tie_word_embeddings": True})
-
-        weight_type_map = self._get_gguf_weight_type(
-            model_config, local_model_path, gguf_weights_map
-        )
+        # Also scan mmproj for multimodal weight types (single read)
+        is_multimodal = hasattr(model_config.hf_config, "vision_config")
+        if is_multimodal:
+            text_cfg = model_config.hf_config.get_text_config()
+            if text_cfg is not model_config.hf_config:
+                is_multimodal = False
+        if is_multimodal:
+            mmproj_file = detect_gguf_multimodal(local_model_path)
+            if mmproj_file is not None:
+                _, mm_wt_map = get_gguf_extra_names_and_weight_type_map(
+                    mmproj_file, gguf_weights_map
+                )
+                weight_type_map.update(mm_wt_map)
         # filter out unquantized modules to skip
         unquant_names = [
             name.removesuffix(".weight")
