@@ -6,6 +6,20 @@ import os
 from collections.abc import Iterable
 from itertools import islice
 
+# Layer-3 MHA capture hook
+_L3_CAPTURE_FLAG = '/home/ice/llm/tmp/.capture_l3'
+_L3_CAPTURE_PATH = '/home/ice/llm/tmp/vllm_l3_dec.pt'
+_l3_cap_live: dict | None = None
+# Layer-3 MHA decode capture hook
+# Phase 1 (prefill): saves k_rope/v_proj. Phase 2 (decode): saves q/k/v/attn_out.
+_L3_DEC_CAPTURE_FLAG = '/home/ice/llm/tmp/.capture_l3_dec'
+_L3_DEC_CAPTURE_PATH = '/home/ice/llm/tmp/vllm_l3_decode.pt'
+_l3_dec_cap: dict | None = None   # shared across phases
+# End-to-end capture: PP0 saves embed_out+input_ids; last rank saves pre-norm hs+residual
+_E2E_FLAG      = '/home/ice/llm/tmp/.capture_e2e'
+_E2E_PP0_PATH  = '/home/ice/llm/tmp/vllm_e2e_pp0.pt'
+_E2E_LAST_PATH = '/home/ice/llm/tmp/vllm_e2e_last.pt'
+
 import torch
 from torch import nn
 
@@ -286,6 +300,7 @@ class Qwen3NextAttention(nn.Module):
 
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.layer_idx = extract_layer_index(prefix)
 
     def forward(
         self,
@@ -293,6 +308,26 @@ class Qwen3NextAttention(nn.Module):
         output: torch.Tensor,
         hidden_states: torch.Tensor,
     ):
+        global _l3_cap_live, _l3_dec_cap
+        _cap = (_l3_cap_live
+                if (not torch.compiler.is_compiling()
+                    and self.layer_idx == 3
+                    and _l3_cap_live is not None)
+                else None)
+        if _cap is not None:
+            _cap['attn_hs_in'] = hidden_states.detach().cpu().float().clone()
+
+        # Decode capture: arm on first call to layer 3 when flag exists
+        _is_prefill = hidden_states.shape[0] > 1
+        if (not torch.compiler.is_compiling()
+                and self.layer_idx == 3
+                and os.path.exists(_L3_DEC_CAPTURE_FLAG)):
+            if _l3_dec_cap is None:
+                _l3_dec_cap = {}
+            _dcap = _l3_dec_cap
+        else:
+            _dcap = None
+
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
@@ -307,6 +342,13 @@ class Qwen3NextAttention(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        if _cap is not None:
+            _cap['q_proj'] = q.detach().cpu().float().clone()
+            _cap['k_proj'] = k.detach().cpu().float().clone()
+            _cap['v_proj'] = v.detach().cpu().float().clone()
+            if self.attn_output_gate:
+                _cap['gate_proj'] = gate.detach().cpu().float().clone()
+
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
             -1, self.num_heads * self.head_dim
         )
@@ -314,13 +356,53 @@ class Qwen3NextAttention(nn.Module):
             -1, self.num_kv_heads * self.head_dim
         )
 
+        if _cap is not None:
+            _cap['q_normed'] = q.detach().cpu().float().clone()
+            _cap['k_normed'] = k.detach().cpu().float().clone()
+            _cap['positions'] = positions.detach().cpu().clone()
+
         q, k = self.rotary_emb(positions, q, k)
 
+        if _cap is not None:
+            _cap['q_rope'] = q.detach().cpu().float().clone()
+            _cap['k_rope'] = k.detach().cpu().float().clone()
+
+        # Decode capture: save per-phase data
+        if _dcap is not None:
+            if _is_prefill:
+                # Phase 1: save full prefill KV so we can reconstruct attention at decode
+                _dcap['prefill_k_rope'] = k.detach().cpu().float().clone()  # [T, kv_heads*head_dim]
+                _dcap['prefill_v'] = v.detach().cpu().float().clone()       # [T, kv_heads*head_dim]
+                _dcap['prefill_positions'] = positions.detach().cpu().clone()
+            else:
+                # Phase 2 (decode, T=1)
+                _dcap['dec_q_rope'] = q.detach().cpu().float().clone()  # [1, heads*head_dim]
+                _dcap['dec_k_rope'] = k.detach().cpu().float().clone()  # [1, kv_heads*head_dim]
+                _dcap['dec_v'] = v.detach().cpu().float().clone()       # [1, kv_heads*head_dim]
+                _dcap['dec_position'] = positions.detach().cpu().clone()
+
         attn_output = self.attn(q, k, v)
+
+        if _cap is not None:
+            _cap['attn_out'] = attn_output.detach().cpu().float().clone()
+
+        # Decode capture: save decode attn_output and finalize
+        if _dcap is not None and not _is_prefill:
+            _dcap['dec_attn_out'] = attn_output.detach().cpu().float().clone()
+            torch.save(_dcap, _L3_DEC_CAPTURE_PATH)
+            _l3_dec_cap = None
+            try:
+                os.unlink(_L3_DEC_CAPTURE_FLAG)
+            except OSError:
+                pass
+            logger.warning('L3 decode capture saved to %s (%d keys)', _L3_DEC_CAPTURE_PATH, len(_dcap))
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
+
+        if _cap is not None:
+            _cap['gated_attn_out'] = attn_output.detach().cpu().float().clone()
 
         output[:], _ = self.o_proj(attn_output)
 
@@ -411,11 +493,37 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor = None,
         **kwargs: object,
     ):
+        _L0_DEC_FLAG = '/home/ice/llm/tmp/.capture_l0'
+        _L0_DEC_PATH = '/home/ice/llm/tmp/vllm_l0_decoder.pt'
+        import os as _os
+        _dec_capturing = (not torch.compiler.is_compiling()
+                          and self.layer_idx == 0
+                          and _os.path.exists(_L0_DEC_FLAG))
+        if _dec_capturing:
+            _dcap = {'dec_in': hidden_states.detach().cpu().float().clone(),
+                     'dec_residual_in': residual.detach().cpu().float().clone() if residual is not None else None}
+
+        # Layer-3 MHA capture
+        global _l3_cap_live
+        _l3_capturing = (not torch.compiler.is_compiling()
+                         and self.layer_idx == 3
+                         and _os.path.exists(_L3_CAPTURE_FLAG))
+        if _l3_capturing:
+            _l3_cap_live = {
+                'dec_in':         hidden_states.detach().cpu().float().clone(),
+                'dec_residual_in': residual.detach().cpu().float().clone() if residual is not None else None,
+            }
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        if _dec_capturing:
+            _dcap['after_input_ln'] = hidden_states.detach().cpu().float().clone()
+        if _l3_capturing:
+            _l3_cap_live['after_input_ln'] = hidden_states.detach().cpu().float().clone()
 
         self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
@@ -433,6 +541,11 @@ class Qwen3NextDecoderLayer(nn.Module):
             raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
 
+        if _dec_capturing:
+            _dcap['after_attn'] = hidden_states.detach().cpu().float().clone()
+        if _l3_capturing:
+            _l3_cap_live['after_attn'] = hidden_states.detach().cpu().float().clone()
+
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
@@ -445,7 +558,30 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        if _dec_capturing:
+            _dcap['after_post_attn_ln'] = hidden_states.detach().cpu().float().clone()
+            _dcap['residual_after_post_ln'] = residual.detach().cpu().float().clone()
+        if _l3_capturing:
+            _l3_cap_live['after_post_attn_ln'] = hidden_states.detach().cpu().float().clone()
+            _l3_cap_live['residual_after_post_ln'] = residual.detach().cpu().float().clone()
+
         hidden_states = self.mlp(hidden_states)
+
+        if _dec_capturing:
+            _dcap['after_mlp'] = hidden_states.detach().cpu().float().clone()
+            torch.save(_dcap, _L0_DEC_PATH)
+        if _l3_capturing:
+            _l3_cap_live['after_mlp'] = hidden_states.detach().cpu().float().clone()
+            torch.save(_l3_cap_live, _L3_CAPTURE_PATH)
+            _l3_cap_live = None
+            try:
+                _os.unlink(_L3_CAPTURE_FLAG)
+            except OSError:
+                pass
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                'L3 MHA capture saved to %s (%d keys)', _L3_CAPTURE_PATH, len(torch.load(_L3_CAPTURE_PATH, weights_only=True)))
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -526,6 +662,42 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         _layer_dbg = int(os.environ.get("VLLM_LAYER_DBG", "0"))
+        # Layer boundary capture.
+        # TRIGGER: touch /home/ice/llm/tmp/.capture_layer
+        # LAYERS:  env VLLM_CAPTURE_LAYERS=N1,N2,...  OR  file .capture_layers_list (one line)
+        # OUTPUT:  /home/ice/llm/tmp/vllm_layer_N.pt per layer
+        # NOTE:    requires --enforce-eager (CUDA graph replay skips Python forward)
+        _CAP_FLAG = '/home/ice/llm/tmp/.capture_layer'
+        _cap_env = os.environ.get("VLLM_CAPTURE_LAYERS",
+                                   os.environ.get("VLLM_CAPTURE_LAYER", "-1"))
+        # Also accept layers from file (works even when env var doesn't reach workers)
+        _cap_list_file = '/home/ice/llm/tmp/.capture_layers_list'
+        if os.path.exists(_cap_list_file):
+            try:
+                with open(_cap_list_file) as _f:
+                    _cap_env = _f.read().strip() or _cap_env
+            except OSError:
+                pass
+        _cap_layers = set(int(x) for x in _cap_env.split(",") if x.strip() not in ("", "-1"))
+        _cap_embed_saved = {}
+        _cap_layers_remaining = set(_cap_layers)
+        if (not torch.compiler.is_compiling()
+                and _cap_layers
+                and os.path.exists(_CAP_FLAG)
+                and get_pp_group().is_first_rank):
+            _cap_embed_saved['embed_out'] = hidden_states.detach().cpu()
+            _cap_embed_saved['embed_residual'] = residual.detach().cpu() if residual is not None else None
+        # E2E capture: PP0 saves input_ids + embed_out
+        if (not torch.compiler.is_compiling()
+                and get_pp_group().is_first_rank
+                and input_ids is not None
+                and os.path.exists(_E2E_FLAG)):
+            torch.save({
+                'input_ids': input_ids.detach().cpu(),
+                'positions': positions.detach().cpu(),
+                'embed_out': hidden_states.detach().cpu().float(),
+            }, _E2E_PP0_PATH)
+            logger.warning('[E2E] embed saved  ids=%s', list(input_ids.shape))
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -540,6 +712,66 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 logger.warning("[LAYER_DBG] layer=%d resid_norm=%.4f hs_norm=%.4f",
                                layer_idx, r.float().norm(dim=-1).mean().item(),
                                hidden_states.float().norm(dim=-1).mean().item())
+            if (not torch.compiler.is_compiling()
+                    and layer_idx in _cap_layers_remaining
+                    and os.path.exists(_CAP_FLAG)):
+                _out = '/home/ice/llm/tmp/vllm_layer_%d.pt' % layer_idx
+                torch.save({
+                    'hidden_states': hidden_states.detach().cpu(),
+                    'residual': residual.detach().cpu() if residual is not None else None,
+                    'layer_idx': layer_idx,
+                    **_cap_embed_saved,
+                }, _out)
+                _cap_layers_remaining.discard(layer_idx)
+                logger.warning('[CAPTURE] layer %d boundary saved to %s  hs=%s',
+                               layer_idx, _out, list(hidden_states.shape))
+
+            # ── Decode-step capture ──────────────────────────────────────────
+            # TRIGGER: echo "N1,N2,..." > /home/ice/llm/tmp/.capture_decode_layers
+            #          then touch /home/ice/llm/tmp/.capture_decode
+            # OUTPUT:  /home/ice/llm/tmp/vllm_dec_s{step}_l{layer}.pt
+            # Saves up to _DEC_CAP_MAX_STEPS decode steps (T=1 forwards only).
+            # Steps are counted per-process via a small counter file.
+            _DEC_FLAG  = '/home/ice/llm/tmp/.capture_decode'
+            _DEC_STEPS = '/home/ice/llm/tmp/.capture_decode_step'   # counter
+            _DEC_MAX   = 30
+            if (not torch.compiler.is_compiling()
+                    and hidden_states.shape[0] == 1          # decode (T=1)
+                    and os.path.exists(_DEC_FLAG)
+                    and get_pp_group().is_first_rank):
+                # Read/increment step counter
+                try:
+                    with open(_DEC_STEPS) as _sf:
+                        _step = int(_sf.read().strip())
+                except Exception:
+                    _step = 0
+                # Read layer list
+                _DEC_LIST = '/home/ice/llm/tmp/.capture_decode_layers'
+                try:
+                    with open(_DEC_LIST) as _lf:
+                        _dec_layers = set(int(x) for x in _lf.read().split(',') if x.strip())
+                except Exception:
+                    _dec_layers = set()
+                if _step < _DEC_MAX and layer_idx in _dec_layers:
+                    _out = '/home/ice/llm/tmp/vllm_dec_s%d_l%d.pt' % (_step, layer_idx)
+                    torch.save({
+                        'hidden_states': hidden_states.detach().cpu(),
+                        'residual': residual.detach().cpu() if residual is not None else None,
+                        'layer_idx': layer_idx,
+                        'step': _step,
+                        'position': positions.detach().cpu(),
+                    }, _out)
+                # Increment counter after last watched layer of this step
+                if _dec_layers and layer_idx == max(_dec_layers):
+                    _step += 1
+                    with open(_DEC_STEPS, 'w') as _sf:
+                        _sf.write(str(_step))
+                    if _step >= _DEC_MAX:
+                        try:
+                            os.remove(_DEC_FLAG)
+                        except OSError:
+                            pass
+                        logger.warning('[DEC_CAPTURE] done — %d steps captured', _step)
             self._maybe_add_hidden_state(
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
@@ -548,6 +780,23 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+        # Last PP rank: remove capture flag now that all PP workers have run
+        if (not torch.compiler.is_compiling()
+                and _cap_layers
+                and os.path.exists(_CAP_FLAG)):
+            os.remove(_CAP_FLAG)
+            logger.warning('[CAPTURE] flag removed by last PP rank after all layers')
+        # E2E capture: last rank saves pre-final-norm hidden_states + residual
+        if (not torch.compiler.is_compiling() and os.path.exists(_E2E_FLAG)):
+            torch.save({
+                'hidden_states': hidden_states.detach().cpu().float(),
+                'residual': residual.detach().cpu().float() if residual is not None else None,
+            }, _E2E_LAST_PATH)
+            try:
+                os.remove(_E2E_FLAG)
+            except OSError:
+                pass
+            logger.warning('[E2E] pre-norm saved  hs=%s', list(hidden_states.shape))
         hidden_states, _ = self.norm(hidden_states, residual)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
